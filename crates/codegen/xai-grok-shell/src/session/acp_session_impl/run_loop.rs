@@ -1149,6 +1149,10 @@ pub(super) async fn run_session(
                                 "Permission state reset via notification"
                             );
                         }
+                        SessionCommand::SetReadonlyReferenceDirs { dirs } => {
+                            *session.tool_context.readonly_reference_dirs.write() = dirs.clone();
+                            session.permissions.set_readonly_reference_dirs(dirs);
+                        }
                         SessionCommand::Rewind { request, respond_to } => {
                             let s = session.clone();
                             tokio::task::spawn_local(async move {

@@ -208,6 +208,12 @@ pub struct ToolContext {
     /// Shared `Arc` written at one chokepoint — see
     /// `SessionActor::set_goal_loop_active_resource` for the rationale.
     pub goal_loop_active_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// Read-only reference directories (Cindy extraDirs / ACP
+    /// `additionalDirectories`): the permission manager denies Edit writes
+    /// into them; the session user_info block lists them so the model knows
+    /// they are available read-only. Replaced wholesale by
+    /// `SessionCommand::SetReadonlyReferenceDirs`.
+    pub readonly_reference_dirs: Arc<parking_lot::RwLock<Vec<std::path::PathBuf>>>,
     /// Turn-scoped force-confirm gate (Cindy per-turn permission policy).
     /// Rewritten at every prompt promotion (see `maybe_start_running_task`);
     /// read by the subagent spawn path so a policy-governed turn propagates
@@ -286,6 +292,7 @@ impl ToolContext {
             auto_wake_enabled: true,
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             turn_force_confirm_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            readonly_reference_dirs: Arc::new(parking_lot::RwLock::new(Vec::new())),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
             task_output_token_budget: None,
             sampler_retry_only_before_output: false,
@@ -328,6 +335,7 @@ impl ToolContext {
             auto_wake_enabled: true,
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             turn_force_confirm_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            readonly_reference_dirs: Arc::new(parking_lot::RwLock::new(Vec::new())),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
             task_output_token_budget: None,
             sampler_retry_only_before_output: false,
@@ -419,6 +427,7 @@ mod tests {
                 auto_wake_enabled: true,
                 goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_force_confirm_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                readonly_reference_dirs: Arc::new(parking_lot::RwLock::new(Vec::new())),
                 blocking_wait_depth: Arc::new(BlockingWaitState::new()),
                 task_output_token_budget: None,
                 sampler_retry_only_before_output: false,

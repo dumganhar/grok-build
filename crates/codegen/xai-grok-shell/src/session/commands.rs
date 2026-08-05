@@ -368,6 +368,13 @@ pub enum SessionCommand {
     SetAutoMode {
         enabled: bool,
     },
+    /// Replace the read-only reference directory set (Cindy extraDirs /
+    /// ACP `additionalDirectories`): forwarded to the permission manager
+    /// (write deny) and into `tool_context.readonly_reference_dirs`
+    /// (user_info injection).
+    SetReadonlyReferenceDirs {
+        dirs: Vec<std::path::PathBuf>,
+    },
     ResetPermissionState,
     Rewind {
         request: RewindRequest,

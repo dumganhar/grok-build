@@ -485,6 +485,7 @@ impl MvpAgent {
                     session_model_id,
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
+                    readonly_reference_dirs: arguments.additional_directories.clone(),
                     prompt_display_cwd: None,
                     is_chat_kind: false,
                 }
@@ -497,6 +498,15 @@ impl MvpAgent {
         }
         spawn_res?;
         tracing::debug!(session_id = %session_id.0, "new_session: spawn_session_actor");
+        // Read-only reference directories (Cindy extraDirs): apply before the
+        // response returns so the first prompt already runs under the boundary.
+        if !arguments.additional_directories.is_empty()
+            && let Some(handle) = self.resident_handle(&session_id)
+        {
+            let _ = handle.cmd_tx.send(crate::session::SessionCommand::SetReadonlyReferenceDirs {
+                dirs: arguments.additional_directories.clone(),
+            });
+        }
         #[cfg(feature = "local-workspace")]
         if local_workspace_intent_present(arguments.meta.as_ref()) {
             self.mark_local_workspace_bound(session_id.clone());
@@ -674,6 +684,7 @@ impl MvpAgent {
             cwd,
             mcp_servers: client_mcp_servers,
             meta: request_meta,
+            additional_directories,
             ..
         } = arguments;
         let policy = AttachPolicy::resolve(op, request_meta.as_ref(), self.restore_code);
@@ -877,12 +888,24 @@ impl MvpAgent {
                     session_model_id: summary.current_model_id.clone(),
                     session_yolo_mode,
                     session_auto_mode: session_auto_mode && !session_yolo_mode,
+                    readonly_reference_dirs: additional_directories.clone(),
                     prompt_display_cwd,
                     is_chat_kind: false,
                 },
             )
             .await?;
             drop(spawn_timer);
+            // Read-only reference directories (Cindy extraDirs) on resume:
+            // apply before the response returns, same as new_session.
+            if !additional_directories.is_empty()
+                && let Some(handle) = self.resident_handle(&session_id)
+            {
+                let _ = handle.cmd_tx.send(
+                    crate::session::SessionCommand::SetReadonlyReferenceDirs {
+                        dirs: additional_directories.clone(),
+                    },
+                );
+            }
         } else {
             tracing::info!(
                 session_id = %session_id.0,

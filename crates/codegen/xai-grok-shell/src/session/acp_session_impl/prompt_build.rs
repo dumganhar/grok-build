@@ -502,6 +502,22 @@ impl SessionActor {
         } else {
             construct_user_message(cwd, self.vcs_kind, None, None).await
         };
+        // Cindy extraDirs (read-only reference directories): list them so the
+        // model knows they exist and that writes into them are denied by the
+        // permission layer regardless of the session permission mode.
+        {
+            let readonly_dirs = self.tool_context.readonly_reference_dirs.read();
+            if !readonly_dirs.is_empty() {
+                let list = readonly_dirs
+                    .iter()
+                    .map(|d| format!("- {}", d.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                out.push_str(&format!(
+                    "\n\nRead-only reference directories (readable/searchable; writes are denied):\n{list}"
+                ));
+            }
+        }
         self.last_announced_local_date
             .set(chrono::Local::now().date_naive());
         self.prefix_carries_fallback_date

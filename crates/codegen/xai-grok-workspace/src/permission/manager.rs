@@ -58,6 +58,7 @@ pub(crate) mod reasons {
     pub const STATIC_ALLOWLIST: &str = "static_allowlist";
     pub const SAFE_COMMAND: &str = "safe_command";
     pub const SESSION_DENY: &str = "session_deny";
+    pub const READONLY_REFERENCE: &str = "readonly_reference";
     pub const PROMPT_DENY: &str = "prompt_deny";
     pub const NEEDS_USER: &str = "needs_user";
     pub const BASH_REQUEST_FLOOR: &str = "bash_request_floor";
@@ -844,6 +845,17 @@ impl PermissionHandle {
         }
     }
 
+    /// Replace the session's read-only reference directory set (Cindy
+    /// extraDirs). Writes into any of them are hard-denied by the actor,
+    /// independent of yolo/auto/ask. Send an empty vec to clear.
+    pub fn set_readonly_reference_dirs(&self, dirs: Vec<std::path::PathBuf>) {
+        if let PermissionHandle::Actor { cmd_tx, .. } = self {
+            if let Err(e) = cmd_tx.send(PermissionCommand::SetReadonlyReferenceDirs(dirs)) {
+                tracing::error!(?e, "failed to send readonly-reference-dirs command");
+            }
+        }
+    }
+
     /// Install a classifier implementation for auto mode (tests / production).
     /// Clears [`Self::has_llm_side_query`] unless you also call
     /// [`Self::set_llm_side_query_wired`]. Prefer
@@ -1129,6 +1141,61 @@ fn grant_allow(reason: &'static str) -> Option<(Decision, &'static str)> {
     Some((Decision::Allow, reason))
 }
 
+/// Read-only reference containment for a write access target. Returns the
+/// matched reference dir when `access` is an Edit into one. Reads/Greps are
+/// intentionally not gated here — they ride the safe-command path.
+fn readonly_reference_hit(
+    access: &AccessKind,
+    request_cwd: &std::path::Path,
+    dirs: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let raw = match access {
+        AccessKind::Edit(path) => path,
+        _ => return None,
+    };
+    if dirs.is_empty() || raw.is_empty() {
+        return None;
+    }
+    let candidate = std::path::Path::new(raw);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        request_cwd.join(candidate)
+    };
+    // Lexical normalization first (collapse `.`/`..` without touching the fs).
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    // The edit target may not exist yet (new file), while the reference dirs
+    // were canonicalized at set time — canonicalizing a non-existent path
+    // fails and would break the prefix match on symlinked roots (macOS
+    // /var → /private/var). Canonicalize the nearest existing ancestor and
+    // append the not-yet-existing tail.
+    let mut ancestor = normalized.as_path();
+    let mut tail_components: Vec<&std::ffi::OsStr> = Vec::new();
+    while !ancestor.exists() {
+        match (ancestor.file_name(), ancestor.parent()) {
+            (Some(name), Some(parent)) => {
+                tail_components.push(name);
+                ancestor = parent;
+            }
+            _ => break,
+        }
+    }
+    let mut resolved = dunce::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for part in tail_components.iter().rev() {
+        resolved.push(part);
+    }
+    dirs.iter().find(|dir| resolved.starts_with(dir)).cloned()
+}
+
 fn bash_grant_pre_decision(
     cmd: &str,
     evaluation: &BashEvaluation,
@@ -1408,6 +1475,9 @@ fn spawn_permission_manager_with_pin(
         // early-Allow short-circuit below so each tool call reaches the host's
         // prompt. Deny paths stay short-circuited (nothing executes either way).
         let mut turn_force_confirm = false;
+        // Read-only reference directories (Cindy extraDirs): Edit writes into
+        // them are hard-denied below, independent of the permission mode.
+        let mut readonly_reference_dirs: Vec<std::path::PathBuf> = Vec::new();
         let prompt_policy = permission_config
             .as_ref()
             .map(|c| c.prompt_policy)
@@ -1460,6 +1530,20 @@ fn spawn_permission_manager_with_pin(
                 PermissionCommand::SetTurnForceConfirm(enabled) => {
                     tracing::info!(enabled, "turn force-confirm gate updated");
                     turn_force_confirm = enabled;
+                }
+                PermissionCommand::SetReadonlyReferenceDirs(dirs) => {
+                    // Canonicalize once at set time; containment checks per call
+                    // then stay prefix comparisons. Missing dirs are kept
+                    // lexically (they may appear later) — a deny computed from
+                    // a lexical path is still the safe direction.
+                    readonly_reference_dirs = dirs
+                        .iter()
+                        .map(|d| dunce::canonicalize(d).unwrap_or_else(|_| d.clone()))
+                        .collect();
+                    tracing::info!(
+                        count = readonly_reference_dirs.len(),
+                        "readonly reference dirs updated"
+                    );
                 }
                 PermissionCommand::SetClassifier(classifier) => {
                     auto_classifier = classifier;
@@ -1697,6 +1781,28 @@ fn spawn_permission_manager_with_pin(
                         );
                         let decision = Decision::PolicyDeny(reason);
                         emit_event(&decision, false, false, None, Some(reasons::POLICY_DENY));
+                        let _ = respond_to.send(decision);
+                        continue;
+                    }
+
+                    // Read-only reference directories (Cindy extraDirs): writes
+                    // into them are hard-denied regardless of yolo/auto — the
+                    // boundary is stronger than the session permission mode.
+                    // Reads stay free via the safe-command path below.
+                    if let Some(dir) =
+                        readonly_reference_hit(&access, request_cwd, &readonly_reference_dirs)
+                    {
+                        let reason = format!(
+                            "read-only reference directory ({}): writes are not allowed",
+                            dir.display()
+                        );
+                        tracing::info!(
+                            tool = ?tool_name,
+                            dir = %dir.display(),
+                            "readonly reference dir: write denied"
+                        );
+                        let decision = Decision::Reject(reason);
+                        emit_event(&decision, false, false, None, Some(reasons::READONLY_REFERENCE));
                         let _ = respond_to.send(decision);
                         continue;
                     }
@@ -9418,6 +9524,147 @@ mod tests {
                     prompts.borrow().len(),
                     0,
                     "deny short-circuit must not become a prompt under the gate"
+                );
+            })
+            .await;
+    }
+
+    // ── Read-only reference directories (Cindy extraDirs) ──
+    //
+    // Writes (Edit) into a reference dir are hard-denied regardless of yolo;
+    // reads stay free; clearing the set restores normal evaluation.
+
+    #[tokio::test]
+    async fn readonly_reference_dirs_deny_edit_even_under_yolo() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let refdir = tmp.path().join("refs");
+                std::fs::create_dir_all(&refdir).unwrap();
+
+                let (mgr, _e) = test_manager(&cwd, true, None); // yolo on
+                mgr.set_readonly_reference_dirs(vec![refdir.clone()]);
+                // Give the actor a beat: the next request round-trips behind the
+                // command in FIFO order, so by the time it resolves the set is live.
+                let denied = mgr
+                    .request(
+                        AccessKind::Edit(refdir.join("notes.md").to_string_lossy().into_owned()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                match &denied {
+                    Decision::Reject(reason) => {
+                        assert!(
+                            reason.contains("read-only reference directory"),
+                            "unexpected reason: {reason}"
+                        );
+                    }
+                    other => panic!("edit into readonly ref dir must be denied, got {other:?}"),
+                }
+
+                // Relative path resolving into the ref dir is denied as well.
+                let relative_denied = mgr
+                    .request(
+                        AccessKind::Edit(format!(
+                            "{}/notes.md",
+                            refdir
+                                .strip_prefix(tmp.path())
+                                .unwrap()
+                                .to_string_lossy()
+                        )),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    matches!(relative_denied, Decision::Reject(_)),
+                    "relative edit path into readonly ref dir must be denied, got {relative_denied:?}"
+                );
+
+                // Edit outside the ref dir still auto-allows under yolo.
+                let outside = mgr
+                    .request(
+                        AccessKind::Edit(
+                            tmp.path().join("work.rs").to_string_lossy().into_owned(),
+                        ),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(outside, Decision::Allow, "yolo edit outside ref dir must Allow");
+
+                // Read inside the ref dir stays free (no prompt, no deny).
+                let read = mgr
+                    .request(
+                        AccessKind::Read(Some(
+                            refdir.join("notes.md").to_string_lossy().into_owned(),
+                        )),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(read, Decision::Allow, "read inside ref dir must Allow");
+
+                // Clearing the set restores normal evaluation.
+                mgr.set_readonly_reference_dirs(vec![]);
+                let after_clear = mgr
+                    .request(
+                        AccessKind::Edit(refdir.join("notes.md").to_string_lossy().into_owned()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    after_clear,
+                    Decision::Allow,
+                    "cleared set must restore yolo auto-allow"
+                );
+            })
+            .await;
+    }
+
+    /// Bash is intentionally not path-checked by this mechanism (same residual
+    /// as Claude's additionalDirectories): in ask mode the command still
+    /// prompts as usual; nothing is silently denied or silently allowed by the
+    /// reference set.
+    #[tokio::test]
+    async fn readonly_reference_dirs_do_not_gate_bash() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let refdir = tmp.path().join("refs");
+                std::fs::create_dir_all(&refdir).unwrap();
+
+                let (mgr, _e) = test_manager(&cwd, true, None); // yolo on
+                mgr.set_readonly_reference_dirs(vec![refdir.clone()]);
+                let d = mgr
+                    .request(
+                        AccessKind::Bash(format!("cat {}", refdir.join("a.txt").display())),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    d,
+                    Decision::Allow,
+                    "bash under yolo is out of scope for the readonly gate, got {d:?}"
                 );
             })
             .await;

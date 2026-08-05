@@ -2663,6 +2663,35 @@ impl acp::Agent for MvpAgent {
                 "Permission state reset for matching sessions"
             );
         }
+        // Cindy extraDirs hot-update: { sessionId, dirs: [absolute paths] }.
+        // Replaces the read-only reference set for that session; an absent or
+        // empty dirs clears it. Unknown session ids are ignored (stale race).
+        if args.method.as_ref() == "x.ai/extra_dirs_changed"
+            && let Ok(params) = serde_json::from_str::<serde_json::Value>(args.params.get())
+        {
+            let session_id = params.get("sessionId").and_then(|v| v.as_str());
+            let dirs: Vec<std::path::PathBuf> = params
+                .get("dirs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(session_id) = session_id {
+                let handle =
+                    self.resident_handle(&acp::SessionId::new(session_id.to_owned()));
+                if let Some(handle) = handle {
+                    let _ = handle.cmd_tx.send(
+                        crate::session::SessionCommand::SetReadonlyReferenceDirs { dirs },
+                    );
+                } else {
+                    tracing::debug!(session_id, "extra_dirs_changed for unknown session ignored");
+                }
+            }
+        }
         if args.method.as_ref() == InternalMethod::EvictSessions.name() {
             self.handle_evict_sessions(&args.params).await;
         }

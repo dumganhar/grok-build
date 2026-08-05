@@ -268,6 +268,12 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub session_model_id: acp::ModelId,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
+    /// Read-only reference directories from ACP `additionalDirectories`
+    /// (Cindy extraDirs). Seeded into `tool_context.readonly_reference_dirs`
+    /// at spawn so the very first user_info prefix lists them; the permission
+    /// manager learns them via the post-spawn SetReadonlyReferenceDirs
+    /// command (processed before any prompt).
+    pub readonly_reference_dirs: Vec<std::path::PathBuf>,
     pub prompt_display_cwd: Option<String>,
     /// Sticky chat product kind for ACU / product skills sourcing.
     pub is_chat_kind: bool,
@@ -444,6 +450,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         session_model_id,
         session_yolo_mode,
         session_auto_mode: false,
+        readonly_reference_dirs: Vec::new(),
         prompt_display_cwd: None,
         is_chat_kind: true,
     }

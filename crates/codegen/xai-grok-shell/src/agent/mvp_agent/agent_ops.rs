@@ -4025,6 +4025,7 @@ impl MvpAgent {
             session_model_id,
             session_yolo_mode,
             session_auto_mode,
+            readonly_reference_dirs,
             prompt_display_cwd,
             is_chat_kind,
         } = spec;
@@ -4251,6 +4252,11 @@ impl MvpAgent {
         tool_ctx.is_turn_active = Some(
             self.subagent_presentation.borrow().turn_active_flag(),
         );
+        // Seed before spawn: the deferred user_info prefix build may run
+        // immediately on the session thread, so the arc must already hold the
+        // read-only reference dirs (Cindy extraDirs) when it reads them.
+        tool_ctx.readonly_reference_dirs =
+            std::sync::Arc::new(parking_lot::RwLock::new(readonly_reference_dirs));
         tool_ctx.monitor_event_buffer = Some(self.monitor_event_buffer.clone());
         tool_ctx.subagent_depth = 0;
         tool_ctx.auto_wake_enabled = self.cfg.borrow().auto_wake_enabled;

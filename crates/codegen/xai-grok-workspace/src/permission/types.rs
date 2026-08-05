@@ -259,6 +259,13 @@ pub enum PermissionCommand {
     /// exclusive with YOLO at the handle level; enabling auto clears yolo
     /// and vice versa when applied by the actor.
     SetAutoMode(bool),
+    /// Read-only reference directories (Cindy extraDirs / ACP
+    /// `additionalDirectories`): writes (Edit) into them are hard-denied
+    /// regardless of yolo/auto — the boundary is stronger than the session
+    /// permission mode. Reads stay free via the safe-command path.
+    /// Replaces the whole set; sessions send it at spawn and on
+    /// `x.ai/extra_dirs_changed`.
+    SetReadonlyReferenceDirs(Vec<std::path::PathBuf>),
     /// Turn-scoped force-confirm: while set, every early-Allow path (yolo,
     /// session grants, policy allow, auto fast-path/classifier allow, safe
     /// lists) falls through to the interactive prompt so the host client
