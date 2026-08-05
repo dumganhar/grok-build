@@ -830,6 +830,20 @@ impl PermissionHandle {
         }
     }
 
+    /// Turn-scoped force-confirm gate (Cindy `turn_permission_policy`):
+    /// while set, every early-Allow path in the actor cascade falls through
+    /// to the interactive prompt so the host client approves each tool call
+    /// explicitly. The session sets it at prompt promotion from the prompt
+    /// `_meta.turn_permission_policy` marker; the next promoted prompt always
+    /// rewrites it (idle turns issue no permission requests).
+    pub fn set_turn_force_confirm(&self, enabled: bool) {
+        if let PermissionHandle::Actor { cmd_tx, .. } = self {
+            if let Err(e) = cmd_tx.send(PermissionCommand::SetTurnForceConfirm(enabled)) {
+                tracing::error!(?e, "failed to send turn force-confirm command");
+            }
+        }
+    }
+
     /// Install a classifier implementation for auto mode (tests / production).
     /// Clears [`Self::has_llm_side_query`] unless you also call
     /// [`Self::set_llm_side_query_wired`]. Prefer
@@ -1390,6 +1404,10 @@ fn spawn_permission_manager_with_pin(
         // Log a refused yolo-enable once per session, not per SetYoloMode.
         let mut pin_refusal_logged = false;
         let mut allow_edits_for_session = false;
+        // Turn-scoped force-confirm (Cindy per-turn policy): suppresses every
+        // early-Allow short-circuit below so each tool call reaches the host's
+        // prompt. Deny paths stay short-circuited (nothing executes either way).
+        let mut turn_force_confirm = false;
         let prompt_policy = permission_config
             .as_ref()
             .map(|c| c.prompt_policy)
@@ -1438,6 +1456,10 @@ fn spawn_permission_manager_with_pin(
                                 Some(crate::permission::auto_mode::default_auto_mode_classifier());
                         }
                     }
+                }
+                PermissionCommand::SetTurnForceConfirm(enabled) => {
+                    tracing::info!(enabled, "turn force-confirm gate updated");
+                    turn_force_confirm = enabled;
                 }
                 PermissionCommand::SetClassifier(classifier) => {
                     auto_classifier = classifier;
@@ -1679,7 +1701,10 @@ fn spawn_permission_manager_with_pin(
                         continue;
                     }
 
-                    if yolo_mode && !shell_forced_prompt {
+                    // Turn force-confirm suppresses the YOLO fast path: the host
+                    // opted this turn into per-call confirmation, so even an
+                    // always-approve session must surface each tool call.
+                    if yolo_mode && !shell_forced_prompt && !turn_force_confirm {
                         tracing::debug!("YOLO mode: auto-approving permission request");
                         let decision = Decision::Allow;
                         emit_event(&decision, true, false, None, Some(reasons::YOLO));
@@ -1702,14 +1727,19 @@ fn spawn_permission_manager_with_pin(
                             yolo_pin,
                         )
                     {
-                        tracing::debug!(
-                            tool = %tool_name,
-                            %reason,
-                            "session grant short-circuit before auto classifier"
-                        );
-                        emit_event(&decision, true, false, None, Some(reason));
-                        let _ = respond_to.send(decision);
-                        continue;
+                        // Turn force-confirm vetoes grant Allows (the host must
+                        // confirm this turn's calls) but keeps grant-era denies
+                        // short-circuited — a deny executes nothing either way.
+                        if !(turn_force_confirm && matches!(decision, Decision::Allow)) {
+                            tracing::debug!(
+                                tool = %tool_name,
+                                %reason,
+                                "session grant short-circuit before auto classifier"
+                            );
+                            emit_event(&decision, true, false, None, Some(reason));
+                            let _ = respond_to.send(decision);
+                            continue;
+                        }
                     }
 
                     // A broad configured policy Allow (e.g. `Bash(*)`) may only
@@ -1720,6 +1750,7 @@ fn spawn_permission_manager_with_pin(
                         && !policy_forced_prompt
                         && !shell_forced_prompt
                         && protected_edit.is_none()
+                        && !turn_force_confirm
                         && bash_assessment_is_clear(bash_evaluation.as_ref())
                         && matches!(policy_decision, Some(Decision::Allow))
                     {
@@ -1740,7 +1771,14 @@ fn spawn_permission_manager_with_pin(
                     // routes through the classifier with typed findings as
                     // evidence; only an actual rule-match Ask (never a fail-closed
                     // one) keeps the classifier out via `admits_auto_classifier`.
-                    if auto_mode && preflight.admits_auto_classifier() {
+                    // Turn force-confirm skips the whole auto-mode arm: fast-path
+                    // and classifier Allows would bypass the host's per-call
+                    // confirmation, and classifier denials should become a host
+                    // decision under a policy-governed turn, not a silent deny.
+                    if auto_mode
+                        && !turn_force_confirm
+                        && preflight.admits_auto_classifier()
+                    {
                         use crate::permission::auto_mode::{
                             AutoFastPath, ClassifierVerdict, access_requires_user_interaction,
                             auto_mode_fast_path,
@@ -1933,6 +1971,7 @@ fn spawn_permission_manager_with_pin(
                         )
                         && !policy_forced_prompt
                         && !auto_forced_prompt
+                        && !turn_force_confirm
                     {
                         tracing::debug!("sandbox: auto-approving bash");
                         let decision = Decision::Allow;
@@ -1971,7 +2010,12 @@ fn spawn_permission_manager_with_pin(
                                 "permission policy allow deferred to confirmation floor"
                             );
                         }
-                        Some(decision) => {
+                        // Turn force-confirm vetoes managed policy Allows (the
+                        // host must confirm this turn's calls); Ask arms keep
+                        // falling through to the prompt as before.
+                        Some(decision)
+                            if !(turn_force_confirm && matches!(decision, Decision::Allow)) =>
+                        {
                             tracing::info!(
                                 tool = ?tool_name,
                                 source = "policy",
@@ -1988,6 +2032,9 @@ fn spawn_permission_manager_with_pin(
                             let _ = respond_to.send(decision);
                             continue;
                         }
+                        // Vetoed managed policy Allow under turn force-confirm:
+                        // fall through to the prompt path below.
+                        Some(_) => {}
                         None => {}
                     }
 
@@ -2126,6 +2173,12 @@ fn spawn_permission_manager_with_pin(
                         && auto_prompt_blocks_allow(&access)
                         && matches!(pre_decision, Some((Decision::Allow, _)))
                     {
+                        pre_decision = None;
+                    }
+                    // Turn force-confirm: neutralize every remaining auto-Allow
+                    // (safe lists, persisted grants, static allowlists) so the
+                    // request reaches the host's prompt. Denies stay.
+                    if turn_force_confirm && matches!(pre_decision, Some((Decision::Allow, _))) {
                         pre_decision = None;
                     }
                     // no prompt needed if we have a pre-decision
@@ -9180,6 +9233,191 @@ mod tests {
                     prompts.borrow().len(),
                     0,
                     "dangerous cmd under Block denies within budget, no prompt"
+                );
+            })
+            .await;
+    }
+
+    // ── Turn-scoped force-confirm gate (Cindy per-turn permission policy) ──
+    //
+    // While the gate is on, every early-Allow path (safe lists, yolo, session
+    // grants, auto fast-path/classifier allow, sandbox bash) must fall through
+    // to a real `request_permission` round-trip; deny paths stay short because
+    // nothing executes either way.
+
+    /// Safe-list Read (normally SAFE_COMMAND auto-Allow) must prompt once the
+    /// gate is on, and the client's allow drives the outcome.
+    #[tokio::test]
+    async fn turn_force_confirm_prompts_safe_list_read() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _e) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::GrokPager);
+
+                // Baseline: safe-list read auto-allows with no prompt.
+                let d = mgr
+                    .request(
+                        AccessKind::Read(Some("src/main.rs".into())),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(d, Decision::Allow, "safe-list baseline must Allow");
+                assert_eq!(prompts.borrow().len(), 0, "baseline must not prompt");
+
+                mgr.set_turn_force_confirm(true);
+                let d = mgr
+                    .request(
+                        AccessKind::Read(Some("src/main.rs".into())),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    prompts.borrow().len(),
+                    1,
+                    "force-confirm turn must issue request_permission for a safe-list read"
+                );
+                // RecordingClient answers reject-once, so the decision must be
+                // the client's choice rather than a silent Allow.
+                assert!(
+                    matches!(d, Decision::Reject(_)),
+                    "client-driven outcome expected under force-confirm, got {d:?}"
+                );
+
+                // Gate off: safe-list behavior returns.
+                mgr.set_turn_force_confirm(false);
+                let d = mgr
+                    .request(
+                        AccessKind::Read(Some("src/lib.rs".into())),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert_eq!(d, Decision::Allow, "post-gate safe-list read must Allow");
+                assert_eq!(prompts.borrow().len(), 1, "post-gate must not add prompts");
+            })
+            .await;
+    }
+
+    /// YOLO fast path is suppressed by the gate: the client still sees a prompt.
+    #[tokio::test]
+    async fn turn_force_confirm_prompts_even_under_yolo() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _e) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::GrokPager);
+                mgr.set_yolo_mode(true);
+
+                // Baseline under yolo: everything auto-allows silently.
+                let d = mgr
+                    .request(AccessKind::Bash("ls".into()), tool_call(), None, None, None)
+                    .await;
+                assert_eq!(d, Decision::Allow, "yolo baseline must Allow");
+                assert_eq!(prompts.borrow().len(), 0, "yolo baseline must not prompt");
+
+                mgr.set_turn_force_confirm(true);
+                let d = mgr
+                    .request(AccessKind::Bash("ls".into()), tool_call(), None, None, None)
+                    .await;
+                assert_eq!(
+                    prompts.borrow().len(),
+                    1,
+                    "force-confirm turn must prompt even under yolo"
+                );
+                assert!(
+                    matches!(d, Decision::Reject(_)),
+                    "client reject-once drives the outcome under the gate, got {d:?}"
+                );
+            })
+            .await;
+    }
+
+    /// Auto-mode fast-path/classifier allows are suppressed by the gate.
+    #[tokio::test]
+    async fn turn_force_confirm_skips_auto_mode_allows() {
+        use crate::permission::auto_mode::LlmPermissionClassifier;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _e) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::GrokPager);
+                mgr.set_auto_mode(true);
+                mgr.set_classifier(Some(LlmPermissionClassifier::with_fixed_model_text(
+                    r#"{"thinking":"t","shouldBlock":false}"#,
+                )));
+
+                mgr.set_turn_force_confirm(true);
+                let _ = mgr
+                    .request(AccessKind::Bash("ls".into()), tool_call(), None, None, None)
+                    .await;
+                assert_eq!(
+                    prompts.borrow().len(),
+                    1,
+                    "force-confirm turn must prompt instead of auto fast-path/classifier allow"
+                );
+            })
+            .await;
+    }
+
+    /// Deny paths stay short-circuited under the gate: a persisted edit deny
+    /// must not turn into a prompt (nothing executes either way).
+    #[tokio::test]
+    async fn turn_force_confirm_keeps_deny_short_circuited() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let cwd = AbsPathBuf::new(tmp.path().to_path_buf()).unwrap();
+                let seeded = PermissionState {
+                    edit_policy: EditPolicy::Reject,
+                    ..Default::default()
+                };
+                persist_state(&cwd, &seeded, None).await;
+
+                let client = RecordingClient::default();
+                let prompts = client.prompts.clone();
+                let (mgr, _e) =
+                    manager_with_recording_client(&cwd, None, client, ClientType::GrokPager);
+                mgr.set_turn_force_confirm(true);
+
+                let d = mgr
+                    .request(
+                        AccessKind::Edit("src/main.rs".into()),
+                        tool_call(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                assert!(
+                    matches!(d, Decision::Reject(_)),
+                    "persisted edit deny must stay a deny under the gate, got {d:?}"
+                );
+                assert_eq!(
+                    prompts.borrow().len(),
+                    0,
+                    "deny short-circuit must not become a prompt under the gate"
                 );
             })
             .await;

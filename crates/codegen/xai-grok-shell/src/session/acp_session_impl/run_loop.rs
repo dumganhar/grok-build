@@ -616,7 +616,7 @@ pub(super) async fn run_session(
                         SessionCommand::SetToolOverrides { overrides } => {
                             session.set_tool_overrides(overrides);
                         }
-                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx } => {
+                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, turn_force_confirm, admission, tool_overrides_update, respond_to, persist_ack, parsed_prompt_tx } => {
                             let origin = super::PromptOrigin::from_prompt_id(&prompt_id);
                             let (actor_admitted, task_wake_fallback) = match admission {
                                 Some(admission) => {
@@ -699,6 +699,7 @@ pub(super) async fn run_session(
                                     verbatim,
                                     json_schema,
                                     send_now,
+                                    turn_force_confirm,
                                     task_wake_fallback,
                                     tool_overrides_update,
                                     respond_to,
@@ -2019,6 +2020,7 @@ pub(super) async fn run_session(
                                     parsed_prompt_tx: None,
                                     queue_meta: None,
                                     send_now: false,
+                                    turn_force_confirm: false,
                                 });
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
@@ -2072,6 +2074,7 @@ pub(super) async fn run_session(
                                     parsed_prompt_tx: None,
                                     queue_meta: None,
                                     send_now: false,
+                                    turn_force_confirm: false,
                                 });
                             }
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;

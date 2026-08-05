@@ -238,6 +238,7 @@ impl SessionActor {
             origin,
             running_display,
             tool_overrides_update,
+            turn_force_confirm,
         ) = {
             let Some(front) = state.pending_inputs.front_mut() else {
                 return;
@@ -258,8 +259,17 @@ impl SessionActor {
                 front.origin.clone(),
                 running_display,
                 front.tool_overrides_update.take(),
+                front.turn_force_confirm,
             )
         };
+        // Apply the promoted prompt's force-confirm marker before any tool of
+        // this turn can reach the permission manager. Every promotion rewrites
+        // the gate (set or clear), so a completed turn never leaks its policy
+        // into the next one.
+        self.tool_context
+            .turn_force_confirm_gate
+            .store(turn_force_confirm, std::sync::atomic::Ordering::Relaxed);
+        self.permissions.set_turn_force_confirm(turn_force_confirm);
         self.apply_tool_overrides_update(tool_overrides_update);
         if matches!(origin, super::PromptOrigin::User) {
             if let Some(gate) = &self.tool_context.task_wake_suppressed {
@@ -598,6 +608,7 @@ impl SessionActor {
             parsed_prompt_tx: None,
             queue_meta: None,
             send_now: false,
+            turn_force_confirm: false,
         });
 
         tracing::info!(

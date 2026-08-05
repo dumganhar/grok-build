@@ -259,6 +259,13 @@ pub enum PermissionCommand {
     /// exclusive with YOLO at the handle level; enabling auto clears yolo
     /// and vice versa when applied by the actor.
     SetAutoMode(bool),
+    /// Turn-scoped force-confirm: while set, every early-Allow path (yolo,
+    /// session grants, policy allow, auto fast-path/classifier allow, safe
+    /// lists) falls through to the interactive prompt so the host client
+    /// approves each tool call explicitly. Deny paths stay short-circuited.
+    /// Set at turn promotion from the prompt's `_meta.turn_permission_policy`
+    /// and reset by the next promoted prompt (idle turns issue no requests).
+    SetTurnForceConfirm(bool),
     /// Install or replace the permission classifier used in auto mode.
     SetClassifier(Option<std::sync::Arc<dyn super::auto_mode::PermissionClassifier>>),
     /// Recent transcript turns for classifier context (compacted by caller).

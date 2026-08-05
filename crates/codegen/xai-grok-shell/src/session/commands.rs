@@ -234,6 +234,13 @@ pub enum SessionCommand {
         /// Also derived server-side during an interruptible wait (see
         /// [`SessionActor::queue_input`]).
         send_now: bool,
+        /// Cindy per-turn permission policy marker from request
+        /// `_meta.turn_permission_policy`: while the promoted turn runs, the
+        /// permission manager suppresses every early-Allow path so each tool
+        /// call reaches the host's `session/request_permission`. Re-written
+        /// unconditionally at every prompt promotion (idle turns issue no
+        /// permission requests), so no separate turn-end reset is needed.
+        turn_force_confirm: bool,
         /// Actor-authoritative admission and deferred fallback for terminal task wakes.
         admission: Option<TaskWakeAdmission>,
         tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,

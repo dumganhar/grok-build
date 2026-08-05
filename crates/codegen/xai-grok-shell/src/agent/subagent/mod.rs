@@ -128,6 +128,10 @@ pub(crate) struct SubagentSpawnContext {
     /// The parent's cutoff at spawn, applied to the child's first turn. `None` if unset.
     pub inherited_tool_overrides: Option<xai_grok_sampling_types::ToolOverrides>,
     pub yolo_mode: bool,
+    /// The parent turn's force-confirm marker at spawn (Cindy per-turn
+    /// permission policy): a policy-governed parent turn propagates the same
+    /// per-call confirmation boundary into the child's first prompt.
+    pub turn_force_confirm: bool,
     pub subagent_event_tx: mpsc::UnboundedSender<SubagentEvent>,
     pub parent_depth: u32,
     pub subagents_max_depth: u32,
@@ -1938,6 +1942,7 @@ fn inject_subagent_completed_prompt(
             traceparent: None,
             json_schema: None,
             send_now: false,
+            turn_force_confirm: false,
             admission: None,
             tool_overrides_update: None,
             respond_to,

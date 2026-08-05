@@ -86,6 +86,13 @@ impl SessionActor {
             // Send-now semantics (see doc): a later real send-now must not
             // leapfrog this fallback in `queue_input`'s FIFO scan.
             send_now: front,
+            // The fallback continues the turn the interjection was aimed at:
+            // inherit its force-confirm gate so a policy-governed turn's
+            // steered follow-up stays policy-governed.
+            turn_force_confirm: self
+                .tool_context
+                .turn_force_confirm_gate
+                .load(std::sync::atomic::Ordering::Relaxed),
         };
         let mut state = self.state.lock().await;
         if front {

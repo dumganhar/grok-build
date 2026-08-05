@@ -21,6 +21,8 @@ pub(crate) struct QueueInputRequest {
     pub(crate) verbatim: bool,
     pub(crate) json_schema: Option<serde_json::Value>,
     pub(crate) send_now: bool,
+    /// See [`SessionCommand::Prompt::turn_force_confirm`].
+    pub(crate) turn_force_confirm: bool,
     pub(crate) task_wake_fallback: Option<TaskWakeFallback>,
     pub(crate) tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
     pub(crate) respond_to: oneshot::Sender<PromptTurnResult>,
@@ -47,6 +49,7 @@ impl QueueInputRequest {
             verbatim: false,
             json_schema: None,
             send_now: false,
+            turn_force_confirm: false,
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
@@ -75,6 +78,7 @@ impl SessionActor {
             verbatim,
             json_schema,
             send_now,
+            turn_force_confirm,
             task_wake_fallback,
             tool_overrides_update,
             respond_to,
@@ -256,6 +260,7 @@ impl SessionActor {
             parsed_prompt_tx,
             queue_meta,
             send_now: false,
+            turn_force_confirm,
         };
 
         // Use `running_prompt_id()` not `current_prompt_id` (cleared while front

@@ -1117,6 +1117,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                         parsed_prompt_tx: None,
                         queue_meta: None,
                         send_now: false,
+                        turn_force_confirm: false,
                     });
             }
             actor
@@ -1556,6 +1557,7 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
                 combined_texts: None,
             }),
             send_now: false,
+            turn_force_confirm: false,
         };
         (item, rx)
     }
@@ -1975,6 +1977,7 @@ async fn cancel_resolves_front_when_running_task_is_none() {
                 combined_texts: None,
             }),
             send_now: false,
+            turn_force_confirm: false,
         };
         (item, rx)
     }
@@ -2544,6 +2547,7 @@ async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
                 combined_texts: None,
             }),
             send_now: false,
+            turn_force_confirm: false,
         }
     }
     let local = tokio::task::LocalSet::new();

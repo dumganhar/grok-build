@@ -208,6 +208,11 @@ pub struct ToolContext {
     /// Shared `Arc` written at one chokepoint — see
     /// `SessionActor::set_goal_loop_active_resource` for the rationale.
     pub goal_loop_active_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// Turn-scoped force-confirm gate (Cindy per-turn permission policy).
+    /// Rewritten at every prompt promotion (see `maybe_start_running_task`);
+    /// read by the subagent spawn path so a policy-governed turn propagates
+    /// the same per-call confirmation boundary into child sessions.
+    pub turn_force_confirm_gate: Arc<std::sync::atomic::AtomicBool>,
     /// Count of interruptible blocking waits the running turn is parked in (via
     /// [`BlockingWaitGuard`]). `queue_input` reads it: a prompt arriving while
     /// non-zero takes the send-now path.
@@ -280,6 +285,7 @@ impl ToolContext {
                 xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL.to_string(),
             auto_wake_enabled: true,
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn_force_confirm_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
             task_output_token_budget: None,
             sampler_retry_only_before_output: false,
@@ -321,6 +327,7 @@ impl ToolContext {
                 xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL.to_string(),
             auto_wake_enabled: true,
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn_force_confirm_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
             task_output_token_budget: None,
             sampler_retry_only_before_output: false,
@@ -411,6 +418,7 @@ mod tests {
                     xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL.to_string(),
                 auto_wake_enabled: true,
                 goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                turn_force_confirm_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 blocking_wait_depth: Arc::new(BlockingWaitState::new()),
                 task_output_token_budget: None,
                 sampler_retry_only_before_output: false,

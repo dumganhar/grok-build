@@ -77,6 +77,7 @@ fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<PromptTurnRes
         parsed_prompt_tx: None,
         queue_meta: None,
         send_now: false,
+        turn_force_confirm: false,
     };
     (item, rx)
 }

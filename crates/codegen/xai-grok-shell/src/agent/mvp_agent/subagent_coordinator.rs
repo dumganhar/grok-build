@@ -403,6 +403,14 @@ impl MvpAgent {
         let inherited_tool_overrides = parent_handle
             .as_ref()
             .and_then(|ps| ps.resolved_tool_overrides.load_full().map(|o| (*o).clone()));
+        let parent_turn_force_confirm = parent_handle
+            .as_ref()
+            .map(|ps| {
+                ps.tool_context
+                    .turn_force_confirm_gate
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .unwrap_or(false);
         Some(crate::agent::subagent::SubagentSpawnContext {
             lsp: parent_lsp,
             process_scope: parent_process_scope,
@@ -423,6 +431,7 @@ impl MvpAgent {
             parent_session_id: parent_session_id.to_string(),
             inherited_tool_overrides,
             yolo_mode,
+            turn_force_confirm: parent_turn_force_confirm,
             subagent_event_tx: self.subagent_event_tx.clone(),
             parent_depth,
             subagents_max_depth: self.cfg.borrow().subagents_max_depth,

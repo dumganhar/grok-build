@@ -1289,6 +1289,17 @@ impl acp::Agent for MvpAgent {
                 }
             }
         };
+        // Cindy per-turn permission policy: the host marks policy-governed
+        // turns with `_meta.turn_permission_policy` so the promoted turn
+        // routes every tool call through `session/request_permission`
+        // instead of Grok-side early-Allow short-circuits. The policy itself
+        // (a host-side predicate) never crosses the wire — truthy is enough.
+        let turn_force_confirm = arguments
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("turn_permission_policy"))
+            .map(|v| v.as_bool().unwrap_or_else(|| !v.is_null()))
+            .unwrap_or(false);
         handle
             .cmd_tx
             .send(SessionCommand::Prompt {
@@ -1304,6 +1315,7 @@ impl acp::Agent for MvpAgent {
                 traceparent: xai_file_utils::trace_context::current_traceparent(),
                 json_schema,
                 send_now,
+                turn_force_confirm,
                 admission: None,
                 tool_overrides_update,
                 respond_to: tx,

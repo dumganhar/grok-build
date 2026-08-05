@@ -1230,6 +1230,7 @@ pub(crate) async fn run_shell_child(
         traceparent: xai_file_utils::trace_context::current_traceparent(),
         json_schema: request.runtime_overrides.output_schema.clone(),
         send_now: false,
+        turn_force_confirm: ctx.turn_force_confirm,
         admission: None,
         tool_overrides_update: None,
         respond_to: prompt_tx,

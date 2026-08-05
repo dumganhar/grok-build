@@ -506,6 +506,7 @@ pub(crate) fn user_item_with_rx(
             combined_texts: None,
         }),
         send_now: false,
+        turn_force_confirm: false,
     };
     (item, rx)
 }
@@ -540,6 +541,7 @@ pub(crate) fn input_with_origin_rx(
         parsed_prompt_tx: None,
         queue_meta: None,
         send_now: false,
+        turn_force_confirm: false,
     };
     (item, rx)
 }
