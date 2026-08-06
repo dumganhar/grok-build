@@ -1,0 +1,184 @@
+# Build multi-platform binaries when a GitHub Release is published
+# (Create release in the UI, or `gh release create …`) and attach them
+# as release assets. Artifact names match the official install script:
+#   grok-<version>-{macos,linux,windows}-{x86_64,aarch64}[.exe]
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach assets to (e.g. v0.2.120)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Composition-root package; binary artifact is still named xai-grok-pager.
+  PACKAGE: xai-grok-pager-bin
+  # Hardened profile used for shipping binaries (see root Cargo.toml).
+  PROFILE: release-dist
+
+jobs:
+  build:
+    name: ${{ matrix.asset_platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- macOS ----
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_platform: macos-aarch64
+            bin_name: xai-grok-pager
+            asset_ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_platform: macos-x86_64
+            bin_name: xai-grok-pager
+            asset_ext: ""
+
+          # ---- Linux (native runners) ----
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_platform: linux-x86_64
+            bin_name: xai-grok-pager
+            asset_ext: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_platform: linux-aarch64
+            bin_name: xai-grok-pager
+            asset_ext: ""
+
+          # ---- Windows ----
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_platform: windows-x86_64
+            bin_name: xai-grok-pager.exe
+            asset_ext: ".exe"
+          # windows-aarch64 is not covered: no stable free GHA runner +
+          # README marks Windows as best-effort.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          # Strip leading 'v' for the version string used in asset names.
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag=${TAG} version=${VERSION}"
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        # Channel / components come from rust-toolchain.toml at the repo root.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config
+
+      - name: Build release binary
+        shell: bash
+        env:
+          GROK_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cargo build \
+            -p "${PACKAGE}" \
+            --profile "${PROFILE}" \
+            --target "${{ matrix.target }}" \
+            --features release-dist \
+            --locked
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          PLATFORM="${{ matrix.asset_platform }}"
+          EXT="${{ matrix.asset_ext }}"
+          SRC="target/${{ matrix.target }}/${PROFILE}/${{ matrix.bin_name }}"
+          ASSET="grok-${VERSION}-${PLATFORM}${EXT}"
+          mkdir -p dist
+          cp "${SRC}" "dist/${ASSET}"
+          # Keep a plain `grok` / `grok.exe` name inside the checksum section.
+          chmod +x "dist/${ASSET}" || true
+          # SHA-256 next to the binary (uploaded as a separate small asset).
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ASSET}" > "${ASSET}.sha256")
+          else
+            (cd dist && shasum -a 256 "${ASSET}" > "${ASSET}.sha256")
+          fi
+          ls -lh dist/
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact (workflow)
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-${{ matrix.asset_platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          # Upload / clobber assets so re-running the workflow is safe.
+          gh release upload "${TAG}" dist/* --clobber
+
+  # Optional summary job so the release page always ends with a single green
+  # "all platforms done" check, even when individual matrix cells finish at
+  # different times.
+  release-summary:
+    name: Release summary
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check matrix result
+        shell: bash
+        run: |
+          result="${{ needs.build.result }}"
+          echo "Matrix result: ${result}"
+          if [[ "${result}" != "success" ]]; then
+            echo "::error::One or more release builds failed"
+            exit 1
+          fi
+          echo "All platform binaries built and uploaded."
