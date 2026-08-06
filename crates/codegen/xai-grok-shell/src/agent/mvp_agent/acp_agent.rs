@@ -2703,11 +2703,8 @@ impl acp::Agent for MvpAgent {
                 .and_then(|v| v.as_str())
                 .is_some_and(|tier| tier.eq_ignore_ascii_case("priority"));
             if let Some(session_id) = session_id {
-                let handle = self
-                    .sessions
-                    .borrow()
-                    .get(&acp::SessionId::new(session_id.to_owned()))
-                    .cloned();
+                let handle =
+                    self.resident_handle(&acp::SessionId::new(session_id.to_owned()));
                 if let Some(handle) = handle {
                     handle
                         .tool_context
