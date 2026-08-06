@@ -145,7 +145,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
                 summary: Some(rs::ReasoningSummary::Concise),
             }),
             safety_identifier: None,
-            service_tier: None,
+            service_tier: req.service_tier,
             store: None,
             stream: None,
             stream_options: None,

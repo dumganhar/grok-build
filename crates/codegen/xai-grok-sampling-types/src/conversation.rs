@@ -624,6 +624,10 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// xAI service tier (`service_tier` on the Responses API). `Priority` is
+    /// Cindy's Fast Mode; `None` keeps the server default (`auto`).
+    /// Verified against the live API: `auto|default|flex|standard|priority`.
+    pub service_tier: Option<rs::ServiceTier>,
 }
 
 impl ConversationRequest {

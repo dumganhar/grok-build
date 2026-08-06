@@ -4257,6 +4257,14 @@ impl MvpAgent {
         // read-only reference dirs (Cindy extraDirs) when it reads them.
         tool_ctx.readonly_reference_dirs =
             std::sync::Arc::new(parking_lot::RwLock::new(readonly_reference_dirs));
+        // Cindy Fast Mode: `_meta.serviceTier: "priority"` seeds the session
+        // gate at spawn (mid-session flips arrive via x.ai/service_tier_changed).
+        tool_ctx.fast_mode_gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            session_meta
+                .and_then(|m| m.get("serviceTier"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|tier| tier.eq_ignore_ascii_case("priority")),
+        ));
         tool_ctx.monitor_event_buffer = Some(self.monitor_event_buffer.clone());
         tool_ctx.subagent_depth = 0;
         tool_ctx.auto_wake_enabled = self.cfg.borrow().auto_wake_enabled;

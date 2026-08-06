@@ -2168,6 +2168,15 @@ impl SessionActor {
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());
             request.x_grok_agent_id = Some(xai_grok_telemetry::id::agent_id());
+            // Cindy Fast Mode: session gate → xAI priority service tier on
+            // every request of the turn. Mid-session flips apply next request.
+            if self
+                .tool_context
+                .fast_mode_gate
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                request.service_tier = Some(xai_grok_sampling_types::rs::ServiceTier::Priority);
+            }
             if request.x_grok_deployment_id.is_none() {
                 request.x_grok_deployment_id = crate::managed_config::resolve_deployment_id(
                     crate::managed_config::resolve_deployment_key().as_deref(),

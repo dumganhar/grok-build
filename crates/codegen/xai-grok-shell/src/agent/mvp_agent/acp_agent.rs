@@ -2692,6 +2692,32 @@ impl acp::Agent for MvpAgent {
                 }
             }
         }
+        // Cindy Fast Mode hot-update: { sessionId, tier: "priority"|"default" }.
+        // Flips the session's service-tier gate; the next request build reads it.
+        if args.method.as_ref() == "x.ai/service_tier_changed"
+            && let Ok(params) = serde_json::from_str::<serde_json::Value>(args.params.get())
+        {
+            let session_id = params.get("sessionId").and_then(|v| v.as_str());
+            let priority = params
+                .get("tier")
+                .and_then(|v| v.as_str())
+                .is_some_and(|tier| tier.eq_ignore_ascii_case("priority"));
+            if let Some(session_id) = session_id {
+                let handle = self
+                    .sessions
+                    .borrow()
+                    .get(&acp::SessionId::new(session_id.to_owned()))
+                    .cloned();
+                if let Some(handle) = handle {
+                    handle
+                        .tool_context
+                        .fast_mode_gate
+                        .store(priority, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    tracing::debug!(session_id, "service_tier_changed for unknown session ignored");
+                }
+            }
+        }
         if args.method.as_ref() == InternalMethod::EvictSessions.name() {
             self.handle_evict_sessions(&args.params).await;
         }

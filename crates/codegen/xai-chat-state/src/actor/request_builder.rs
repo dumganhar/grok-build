@@ -145,6 +145,9 @@ impl ChatStateActor {
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            // Set by the session turn loop (Cindy Fast Mode gate), not by the
+            // chat-state builder — it stays `None` here.
+            service_tier: None,
         }
     }
 }

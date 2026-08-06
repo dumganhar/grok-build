@@ -25,6 +25,24 @@ fn test_conversation_request_to_responses_api() {
 }
 
 #[test]
+fn service_tier_flows_into_create_response() {
+    // Cindy Fast Mode: the turn loop sets ServiceTier::Priority on the request;
+    // the wire must carry it verbatim (xAI accepts
+    // auto|default|flex|standard|priority).
+    let mut req = ConversationRequest::from_items(vec![ConversationItem::user("hi")]);
+    assert_eq!(
+        Into::<rs::CreateResponse>::into(&req).service_tier,
+        None,
+        "default request must not pin a tier"
+    );
+    req.service_tier = Some(rs::ServiceTier::Priority);
+    let responses_req: rs::CreateResponse = (&req).into();
+    assert_eq!(responses_req.service_tier, Some(rs::ServiceTier::Priority));
+    let json = serde_json::to_value(&responses_req).expect("serialize");
+    assert_eq!(json["service_tier"], serde_json::json!("priority"));
+}
+
+#[test]
 fn function_tool_colliding_with_hosted_web_search_is_dropped() {
     let mut req =
         ConversationRequest::from_items(vec![ConversationItem::user("hi")]).with_tools(vec![
