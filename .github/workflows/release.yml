@@ -1,7 +1,8 @@
 # Build multi-platform binaries when a GitHub Release is published
 # (Create release in the UI, or `gh release create …`) and attach them
-# as release assets. Artifact names match the official install script:
-#   grok-<version>-{macos,linux,windows}-{x86_64,aarch64}[.exe]
+# as release assets. Each platform uploads a zip (not a bare binary):
+#   grok-<version>-{macos,linux,windows}-{x86_64,aarch64}.zip
+# The zip contains a single entry: `grok` (Unix) or `grok.exe` (Windows).
 name: Release
 
 on:
@@ -38,31 +39,31 @@ jobs:
             target: aarch64-apple-darwin
             asset_platform: macos-aarch64
             bin_name: xai-grok-pager
-            asset_ext: ""
+            packaged_bin: grok
           - os: macos-latest
             target: x86_64-apple-darwin
             asset_platform: macos-x86_64
             bin_name: xai-grok-pager
-            asset_ext: ""
+            packaged_bin: grok
 
           # ---- Linux (native runners) ----
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_platform: linux-x86_64
             bin_name: xai-grok-pager
-            asset_ext: ""
+            packaged_bin: grok
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_platform: linux-aarch64
             bin_name: xai-grok-pager
-            asset_ext: ""
+            packaged_bin: grok
 
           # ---- Windows ----
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_platform: windows-x86_64
             bin_name: xai-grok-pager.exe
-            asset_ext: ".exe"
+            packaged_bin: grok.exe
           # windows-aarch64 is not covered: no stable free GHA runner +
           # README marks Windows as best-effort.
 
@@ -123,26 +124,40 @@ jobs:
             --features release-dist \
             --locked
 
-      - name: Stage artifact
+      - name: Stage zip artifact
         id: stage
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${{ steps.ver.outputs.version }}"
           PLATFORM="${{ matrix.asset_platform }}"
-          EXT="${{ matrix.asset_ext }}"
           SRC="target/${{ matrix.target }}/${PROFILE}/${{ matrix.bin_name }}"
-          ASSET="grok-${VERSION}-${PLATFORM}${EXT}"
-          mkdir -p dist
-          cp "${SRC}" "dist/${ASSET}"
-          # Keep a plain `grok` / `grok.exe` name inside the checksum section.
-          chmod +x "dist/${ASSET}" || true
-          # SHA-256 next to the binary (uploaded as a separate small asset).
+          PACKAGED_BIN="${{ matrix.packaged_bin }}"
+          ASSET="grok-${VERSION}-${PLATFORM}.zip"
+
+          mkdir -p dist/stage
+          cp "${SRC}" "dist/stage/${PACKAGED_BIN}"
+          chmod +x "dist/stage/${PACKAGED_BIN}" || true
+
+          # Prefer system zip; fall back to Python (available on all GHA runners,
+          # including windows-latest where Info-ZIP may be missing).
+          if command -v zip >/dev/null 2>&1; then
+            (cd dist/stage && zip -q "../${ASSET}" "${PACKAGED_BIN}")
+          else
+            PY=python3
+            command -v python3 >/dev/null 2>&1 || PY=python
+            "${PY}" -c "import zipfile; from pathlib import Path; src=Path('dist/stage')/'${PACKAGED_BIN}'; out=Path('dist')/'${ASSET}'; zf=zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED); zf.write(src, arcname='${PACKAGED_BIN}'); zf.close()"
+          fi
+
+          # Checksum of the zip (not the bare binary).
           if command -v sha256sum >/dev/null 2>&1; then
             (cd dist && sha256sum "${ASSET}" > "${ASSET}.sha256")
           else
             (cd dist && shasum -a 256 "${ASSET}" > "${ASSET}.sha256")
           fi
+
+          # Do not upload the unpacked binary or staging dir to the release.
+          rm -rf dist/stage
           ls -lh dist/
           echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
 
@@ -150,7 +165,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: grok-${{ matrix.asset_platform }}
-          path: dist/*
+          path: |
+            dist/*.zip
+            dist/*.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -161,8 +178,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.ver.outputs.tag }}"
-          # Upload / clobber assets so re-running the workflow is safe.
-          gh release upload "${TAG}" dist/* --clobber
+          # Upload only zip + checksum; clobber so re-runs are safe.
+          gh release upload "${TAG}" dist/*.zip dist/*.sha256 --clobber
 
   # Optional summary job so the release page always ends with a single green
   # "all platforms done" check, even when individual matrix cells finish at
@@ -182,4 +199,4 @@ jobs:
             echo "::error::One or more release builds failed"
             exit 1
           fi
-          echo "All platform binaries built and uploaded."
+          echo "All platform zip packages built and uploaded."
