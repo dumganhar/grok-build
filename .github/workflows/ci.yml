@@ -44,9 +44,11 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
-        # Channel / components come from rust-toolchain.toml at the repo root.
+        # Keep in sync with rust-toolchain.toml channel.
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.94.0"
+          components: rustfmt, clippy
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
