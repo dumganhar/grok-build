@@ -4,6 +4,7 @@
 //! [`SamplingEvent`]s. Pure: no I/O, no shell coupling.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -17,6 +18,198 @@ use xai_grok_sampling_types::{
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
+
+const TAGGED_TOOL_CALL_OPEN: &str = "<tool_call>";
+const TAGGED_TOOL_CALL_CLOSE: &str = "</tool_call>";
+
+#[derive(Debug)]
+struct TaggedToolCall {
+    name: String,
+    arguments: String,
+    range: Range<usize>,
+}
+
+fn parse_tagged_tool_call(body: &str) -> Option<(String, String)> {
+    const FUNCTION_OPEN: &str = "<function=";
+    const FUNCTION_CLOSE: &str = "</function>";
+    const PARAMETER_OPEN: &str = "<parameter=";
+    const PARAMETER_CLOSE: &str = "</parameter>";
+
+    let name_start = body.find(FUNCTION_OPEN)? + FUNCTION_OPEN.len();
+    let name_end = name_start + body[name_start..].find('>')?;
+    let name = body[name_start..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let parameters_start = name_end + 1;
+    let parameters_end = parameters_start + body[parameters_start..].find(FUNCTION_CLOSE)?;
+    let parameters = &body[parameters_start..parameters_end];
+    let mut arguments = serde_json::Map::new();
+    let mut cursor = 0;
+
+    while let Some(open_offset) = parameters[cursor..].find(PARAMETER_OPEN) {
+        let key_start = cursor + open_offset + PARAMETER_OPEN.len();
+        let key_end = key_start + parameters[key_start..].find('>')?;
+        let value_start = key_end + 1;
+        let value_end = value_start + parameters[value_start..].find(PARAMETER_CLOSE)?;
+        let key = parameters[key_start..key_end].trim();
+        if key.is_empty() {
+            return None;
+        }
+        let raw_value = parameters[value_start..value_end].trim();
+        let value = serde_json::from_str(raw_value)
+            .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_owned()));
+        arguments.insert(key.to_owned(), value);
+        cursor = value_end + PARAMETER_CLOSE.len();
+    }
+
+    Some((
+        name.to_owned(),
+        serde_json::Value::Object(arguments).to_string(),
+    ))
+}
+
+fn parse_tagged_tool_calls(content: &str) -> Vec<TaggedToolCall> {
+    let mut calls = Vec::new();
+    let mut cursor = 0;
+    while let Some(open_offset) = content[cursor..].find(TAGGED_TOOL_CALL_OPEN) {
+        let start = cursor + open_offset;
+        let body_start = start + TAGGED_TOOL_CALL_OPEN.len();
+        let Some(close_offset) = content[body_start..].find(TAGGED_TOOL_CALL_CLOSE) else {
+            break;
+        };
+        let body_end = body_start + close_offset;
+        let end = body_end + TAGGED_TOOL_CALL_CLOSE.len();
+        if let Some((name, arguments)) = parse_tagged_tool_call(&content[body_start..body_end]) {
+            calls.push(TaggedToolCall {
+                name,
+                arguments,
+                range: start..end,
+            });
+        }
+        cursor = end;
+    }
+    calls
+}
+
+fn repaired_native_arguments(native: &str, tagged: &str) -> Option<String> {
+    let tagged = serde_json::from_str::<serde_json::Value>(tagged).ok()?;
+    let Ok(mut native) = serde_json::from_str::<serde_json::Value>(native) else {
+        return Some(tagged.to_string());
+    };
+    repair_argument_value(&mut native, &tagged).then(|| native.to_string())
+}
+
+fn argument_value_is_placeholder(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(value) => value.is_empty(),
+        serde_json::Value::Array(value) => value.is_empty(),
+        serde_json::Value::Object(value) => value.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+}
+
+fn repair_argument_value(native: &mut serde_json::Value, tagged: &serde_json::Value) -> bool {
+    if native == tagged {
+        return false;
+    }
+    if argument_value_is_placeholder(tagged) {
+        return false;
+    }
+    if argument_value_is_placeholder(native) {
+        *native = tagged.clone();
+        return true;
+    }
+
+    match (native, tagged) {
+        (serde_json::Value::Object(native), serde_json::Value::Object(tagged)) => {
+            let mut changed = false;
+            for (key, native_value) in native {
+                if let Some(tagged_value) = tagged.get(key) {
+                    changed |= repair_argument_value(native_value, tagged_value);
+                }
+            }
+            changed
+        }
+        (serde_json::Value::Array(native), serde_json::Value::Array(tagged))
+            if native.len() == tagged.len() =>
+        {
+            native
+                .iter_mut()
+                .zip(tagged)
+                .fold(false, |changed, (native, tagged)| {
+                    repair_argument_value(native, tagged) || changed
+                })
+        }
+        (native, tagged) if std::mem::discriminant(native) != std::mem::discriminant(tagged) => {
+            *native = tagged.clone();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Return the text prefix that is safe to stream before a possible tagged tool
+/// call. A partial opening marker is held so chunk boundaries cannot leak it.
+fn streaming_safe_prefix_len(text: &str) -> (usize, bool) {
+    if let Some(index) = text.find(TAGGED_TOOL_CALL_OPEN) {
+        return (index, true);
+    }
+
+    let text = text.as_bytes();
+    let marker = TAGGED_TOOL_CALL_OPEN.as_bytes();
+    let held_suffix_len = (1..marker.len())
+        .rev()
+        .find(|&len| text.ends_with(&marker[..len]))
+        .unwrap_or(0);
+    (text.len() - held_suffix_len, false)
+}
+
+/// Some OpenAI-compatible model servers duplicate native tool calls as tagged
+/// assistant text. The native call owns execution; recover its arguments from
+/// the tagged twin only when malformed, and hide every matched text duplicate.
+fn recover_tagged_tool_calls(content: &str, tool_calls: &mut [ToolCall]) -> String {
+    if !content.contains(TAGGED_TOOL_CALL_OPEN) {
+        return content.to_owned();
+    }
+
+    let tagged_calls = parse_tagged_tool_calls(content);
+    let mut used = vec![false; tagged_calls.len()];
+    for call in tool_calls {
+        let Some((index, tagged)) = tagged_calls
+            .iter()
+            .enumerate()
+            .find(|(index, tagged)| !used[*index] && tagged.name == call.name)
+        else {
+            continue;
+        };
+        used[index] = true;
+        if let Some(arguments) = repaired_native_arguments(&call.arguments, &tagged.arguments) {
+            call.arguments = std::sync::Arc::<str>::from(arguments);
+            tracing::warn!(
+                tool_call_id = %call.id,
+                tool_name = %call.name,
+                "recovered malformed or incomplete Chat Completions tool arguments from tagged assistant text"
+            );
+        }
+    }
+
+    if !used.iter().any(|value| *value) {
+        return content.to_owned();
+    }
+    let mut visible = String::with_capacity(content.len());
+    let mut cursor = 0;
+    for (tagged, used) in tagged_calls.iter().zip(used) {
+        if used {
+            visible.push_str(&content[cursor..tagged.range.start]);
+            cursor = tagged.range.end;
+        }
+    }
+    visible.push_str(&content[cursor..]);
+    visible
+}
 
 /// Transform a raw Chat Completions chunk stream into a stream of
 /// [`SamplingEvent`]s.
@@ -68,6 +261,8 @@ pub fn stream_chat_completions<'a>(
         let mut finish_reason: Option<StopReason> = None;
 
         let mut content_acc = String::new();
+        let mut streamed_content_len = 0;
+        let mut defer_tagged_text = false;
         let mut reasoning_acc = String::new();
         // Tool call deltas keyed by positional index. Each entry is
         // (id, name, arguments_buffer); the first chunk for an index
@@ -163,15 +358,24 @@ pub fn stream_chat_completions<'a>(
                     }
                     chunk_has_content = true;
                     chunk_timestamps.push(Instant::now());
-                    chunk_index += 1;
-                    message_chunk_count += 1;
                     content_acc.push_str(&text);
-                    yield SamplingEvent::ChannelToken {
-                        request_id: request_id.clone(),
-                        channel: SamplingChannel::Text,
-                        text,
-                        chunk_index,
-                    };
+                    if !defer_tagged_text {
+                        let pending = &content_acc[streamed_content_len..];
+                        let (safe_len, found_tag) = streaming_safe_prefix_len(pending);
+                        let safe_text = pending[..safe_len].to_owned();
+                        streamed_content_len += safe_len;
+                        defer_tagged_text = found_tag;
+                        if !safe_text.is_empty() {
+                            chunk_index += 1;
+                            message_chunk_count += 1;
+                            yield SamplingEvent::ChannelToken {
+                                request_id: request_id.clone(),
+                                channel: SamplingChannel::Text,
+                                text: safe_text,
+                                chunk_index,
+                            };
+                        }
+                    }
                 }
 
                 if let Some(thought) = delta.reasoning_content
@@ -245,7 +449,7 @@ pub fn stream_chat_completions<'a>(
         }
 
         // ── Build the final response ─────────────────────────────────
-        let tool_calls: Vec<ToolCall> = tool_call_acc
+        let mut tool_calls: Vec<ToolCall> = tool_call_acc
             .into_values()
             .map(|(id, name, arguments)| ToolCall {
                 id: std::sync::Arc::<str>::from(id),
@@ -253,6 +457,27 @@ pub fn stream_chat_completions<'a>(
                 arguments: std::sync::Arc::<str>::from(arguments),
             })
             .collect();
+        let visible_content = recover_tagged_tool_calls(&content_acc, &mut tool_calls);
+        let streamed_prefix = &content_acc[..streamed_content_len];
+        let deferred_visible_text = match visible_content.strip_prefix(streamed_prefix) {
+            Some(text) => text.to_owned(),
+            None => {
+                tracing::warn!(
+                    "reconciled Chat Completions text did not retain its streamed prefix"
+                );
+                visible_content.clone()
+            }
+        };
+        if !deferred_visible_text.is_empty() {
+            chunk_index += 1;
+            message_chunk_count += 1;
+            yield SamplingEvent::ChannelToken {
+                request_id: request_id.clone(),
+                channel: SamplingChannel::Text,
+                text: deferred_visible_text,
+                chunk_index,
+            };
+        }
 
         // Honor tool calls by overriding the stop reason if the model
         // forgot to set it (mirrors the shell's behavior).
@@ -269,7 +494,7 @@ pub fn stream_chat_completions<'a>(
                 ));
             }
             items.push(ConversationItem::Assistant(AssistantItem {
-                content: std::sync::Arc::<str>::from(content_acc),
+                content: std::sync::Arc::<str>::from(visible_content),
                 tool_calls,
                 model_id: Some(model),
                 model_fingerprint,
@@ -578,6 +803,166 @@ mod tests {
                 assert_eq!(calls[0].arguments.as_ref(), "{\"x\":1}");
                 // Tool calls force ToolCalls stop reason.
                 assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_recover_from_tagged_assistant_text() {
+        let tagged = concat!(
+            "Waiting...<tool_call>\n",
+            "<function=get_command_or_subagent_output>\n",
+            "<parameter=task_ids>[\"task-1\"]</parameter>\n",
+            "<parameter=timeout_ms>60000</parameter>\n",
+            "</function>\n",
+            "</tool_call>"
+        );
+        let tool_chunk = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ChunkToolCallDelta {
+                index: 0,
+                id: Some("call_wait".into()),
+                kind: Some("function".into()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some("get_command_or_subagent_output".into()),
+                    arguments: Some("{\"task_ids\":[\"task-1\"],\"timeout_ms\":".into()),
+                }),
+            }],
+            tool_call_id: None,
+        }]);
+        let split = tagged.find(TAGGED_TOOL_CALL_OPEN).unwrap() + "<tool_".len();
+        let raw = stream::iter(vec![
+            Ok(text_chunk(&tagged[..split])),
+            Ok(text_chunk(&tagged[split..])),
+            Ok(tool_chunk),
+        ])
+        .boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Text,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed_text, "Waiting...");
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let assistant = response.assistant().expect("assistant item present");
+                assert_eq!(assistant.content.as_ref(), "Waiting...");
+                let arguments: serde_json::Value =
+                    serde_json::from_str(&assistant.tool_calls[0].arguments).unwrap();
+                assert_eq!(arguments["task_ids"], serde_json::json!(["task-1"]));
+                assert_eq!(arguments["timeout_ms"], 60_000);
+                assert_eq!(response.message_chunks_emitted, 1);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placeholder_tool_argument_recovers_from_tagged_assistant_text() {
+        let tagged = concat!(
+            "<tool_call>\n",
+            "<function=get_command_or_subagent_output>\n",
+            "<parameter=task_ids>[\"task-1\"]</parameter>\n",
+            "<parameter=timeout_ms>60000</parameter>\n",
+            "</function>\n",
+            "</tool_call>"
+        );
+        let mut tool_calls = vec![ToolCall {
+            id: std::sync::Arc::<str>::from("call_wait"),
+            name: "get_command_or_subagent_output".into(),
+            arguments: std::sync::Arc::<str>::from(
+                r#"{"task_ids":["native-task"],"timeout_ms":{}}"#,
+            ),
+        }];
+
+        let visible = recover_tagged_tool_calls(tagged, &mut tool_calls);
+
+        assert_eq!(visible, "");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"task_ids": ["native-task"], "timeout_ms": 60_000})
+        );
+    }
+
+    #[test]
+    fn valid_tool_arguments_remain_authoritative_while_duplicate_text_is_hidden() {
+        let tagged = concat!(
+            "<tool_call>\n",
+            "<function=get_command_or_subagent_output>\n",
+            "<parameter=task_ids>[\"tagged-task\"]</parameter>\n",
+            "<parameter=timeout_ms>60000</parameter>\n",
+            "</function>\n",
+            "</tool_call>"
+        );
+        let native_arguments = r#"{"task_ids":["native-task"],"timeout_ms":120000}"#;
+        let mut tool_calls = vec![ToolCall {
+            id: std::sync::Arc::<str>::from("call_wait"),
+            name: "get_command_or_subagent_output".into(),
+            arguments: std::sync::Arc::<str>::from(native_arguments),
+        }];
+
+        let visible = recover_tagged_tool_calls(tagged, &mut tool_calls);
+
+        assert_eq!(visible, "");
+        assert_eq!(tool_calls[0].arguments.as_ref(), native_arguments);
+    }
+
+    #[tokio::test]
+    async fn unmatched_tagged_tool_text_is_preserved() {
+        let tagged = concat!(
+            "<tool_call>\n",
+            "<function=example>\n",
+            "<parameter=value>1</parameter>\n",
+            "</function>\n",
+            "</tool_call>"
+        );
+        let raw = stream::iter(vec![
+            Ok(text_chunk("<tool_")),
+            Ok(text_chunk(&tagged["<tool_".len()..])),
+        ])
+        .boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Text,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed_text, tagged);
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant().unwrap().content.as_ref(), tagged);
+                assert_eq!(response.message_chunks_emitted, 1);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
