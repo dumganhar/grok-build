@@ -444,6 +444,24 @@ fn subagent_output_roundtrips_through_output_json() {
     assert_eq!(read_subagent_output(dir.path()), None);
 }
 #[test]
+fn persisted_subagent_output_stays_inside_parent_session() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let child = parent.path().join("subagents").join("child-1");
+    assert!(write_subagent_output(&child, "durable output"));
+    assert_eq!(
+        read_persisted_subagent_output(parent.path(), "child-1").as_deref(),
+        Some("durable output")
+    );
+    assert_eq!(
+        read_persisted_subagent_output(parent.path(), "../outside"),
+        None
+    );
+    assert_eq!(
+        read_persisted_subagent_output(parent.path(), "..\\outside"),
+        None
+    );
+}
+#[test]
 fn explicit_override_takes_precedence_over_role() {
     let overrides = SubagentRuntimeOverrides {
         model: Some("explicit-model".into()),

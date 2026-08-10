@@ -638,6 +638,9 @@ pub struct ChatChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
+    /// OpenAI-compatible providers may expose reasoning under this newer alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// Tool call deltas. Handles `null` in JSON as empty vec.
     #[serde(
         default,

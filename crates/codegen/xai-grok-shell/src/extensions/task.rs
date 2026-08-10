@@ -186,6 +186,8 @@ impl From<SubagentInspection> for SubagentLiveSnapshotDto {
 struct GetSubagentRequest {
     subagent_id: String,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
     block: Option<bool>,
     #[serde(default)]
     timeout_ms: Option<u64>,
@@ -195,6 +197,8 @@ struct GetSubagentRequest {
 #[serde(rename_all = "camelCase")]
 struct GetSubagentResponse {
     snapshot: Option<SubagentSnapshotDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
 }
 
 /// ACP DTO for a single subagent snapshot (any status).
@@ -426,6 +430,14 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
             let snapshot = agent
                 .query_subagent(&req.subagent_id, block, Some(timeout_ms))
                 .await;
+            let output = snapshot
+                .is_none()
+                .then(|| {
+                    req.session_id.as_deref().and_then(|session_id| {
+                        agent.persisted_subagent_output(session_id, &req.subagent_id)
+                    })
+                })
+                .flatten();
             let inspection = agent.inspect_subagent(&req.subagent_id).await;
             let (parent_session_id, child_session_id, provenance) = inspection
                 .map(|inspection| {
@@ -448,6 +460,7 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
                         provenance,
                     )
                 }),
+                output,
             }))
         }
         "x.ai/subagent/list_running" => {
@@ -690,9 +703,24 @@ mod tests {
 
     #[test]
     fn get_subagent_response_null_snapshot() {
-        let resp = GetSubagentResponse { snapshot: None };
+        let resp = GetSubagentResponse {
+            snapshot: None,
+            output: None,
+        };
         let json = serde_json::to_value(&resp).expect("should serialize");
         assert!(json["snapshot"].is_null());
+        assert!(json.get("output").is_none());
+    }
+
+    #[test]
+    fn get_subagent_response_can_carry_durable_output_without_snapshot() {
+        let resp = GetSubagentResponse {
+            snapshot: None,
+            output: Some("durable output".into()),
+        };
+        let json = serde_json::to_value(&resp).expect("should serialize");
+        assert!(json["snapshot"].is_null());
+        assert_eq!(json["output"], "durable output");
     }
 
     #[test]
@@ -721,6 +749,7 @@ mod tests {
                 "child-1".into(),
                 Default::default(),
             )),
+            output: None,
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
         let s = &json["snapshot"];
@@ -757,6 +786,7 @@ mod tests {
                 "child-2".into(),
                 Default::default(),
             )),
+            output: None,
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
         let s = &json["snapshot"];

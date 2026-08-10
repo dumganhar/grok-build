@@ -3000,6 +3000,17 @@ impl MvpAgent {
             .query(subagent_id, block, timeout_ms)
             .await
     }
+    /// Read a completed child's durable output after coordinator eviction.
+    pub(crate) fn persisted_subagent_output(
+        &self,
+        parent_session_id: &str,
+        subagent_id: &str,
+    ) -> Option<String> {
+        let sid = acp::SessionId::new(parent_session_id);
+        let handle = self.get_session_handle(&sid)?;
+        let session_dir = crate::session::persistence::session_dir(&handle.info);
+        crate::agent::subagent::read_persisted_subagent_output(&session_dir, subagent_id)
+    }
     pub(super) async fn spawned_subagent_refs_for_prompt(
         &self,
         parent_session_id: &str,

@@ -456,6 +456,7 @@ impl ChildControl for ShellChildRuntime {
                 context_usage_pct: snapshot.context_window_usage,
                 tools_used: snapshot.tools_used,
                 error_count: snapshot.error_count,
+                last_agent_message: snapshot.last_agent_message,
             }
         })
     }
@@ -2094,7 +2095,8 @@ fn emit_subagent_notification(
 /// Progress notification emission interval.
 const PROGRESS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Change signature for the progress-publisher dedupe:
-/// `(turn_count, tool_call_count, context_usage_pct, error_count, tokens_used)`.
+/// `(turn_count, tool_call_count, context_usage_pct, error_count, tokens_used,
+/// assistant_message_count)`.
 ///
 /// `tokens_used` is part of the signature so rising child token spend always
 /// publishes a tick: goal token accounting (subagent records, live totals,
@@ -2102,7 +2104,7 @@ const PROGRESS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from
 /// climb while turn/tool counts and the coarse context-usage *percent* bucket
 /// stay flat. Omitting it would stall those updates until the heartbeat or an
 /// unrelated field moved.
-type ProgressSignature = (u32, u32, u8, u32, u64);
+type ProgressSignature = (u32, u32, u8, u32, u64, u32);
 /// Whether a progress tick should be emitted given the previous and current
 /// [`ProgressSignature`]s. Emits on any change, or when `heartbeat_due`
 /// forces a keep-alive after an idle gap.
@@ -2155,7 +2157,7 @@ fn spawn_progress_publisher(
     tokio::task::spawn_local(async move {
         let mut interval = tokio::time::interval(PROGRESS_PUBLISH_INTERVAL);
         interval.tick().await;
-        let mut last_signature: ProgressSignature = (0, 0, 0, 0, 0);
+        let mut last_signature: ProgressSignature = (0, 0, 0, 0, 0, 0);
         let mut last_emit_at = tokio::time::Instant::now();
         let heartbeat_max = tokio::time::Duration::from_secs(8);
         loop {
@@ -2173,6 +2175,7 @@ fn spawn_progress_publisher(
                 signals.context_window_usage,
                 signals.error_count,
                 signals.context_tokens_used,
+                signals.assistant_message_count,
             );
             let heartbeat_due = last_emit_at.elapsed() >= heartbeat_max;
             if !progress_tick_should_emit(last_signature, sig, heartbeat_due) {
@@ -2193,6 +2196,7 @@ fn spawn_progress_publisher(
                 context_usage_pct: signals.context_window_usage,
                 tools_used: signals.tools_used,
                 error_count: signals.error_count,
+                last_agent_message: signals.last_agent_message.clone(),
             };
             let notification = SessionNotification {
                 session_id: acp::SessionId::new(parent_session_id.clone()),
@@ -2216,10 +2220,15 @@ fn spawn_progress_publisher(
 #[cfg(test)]
 mod progress_publisher_tests {
     use super::{ProgressSignature, progress_tick_should_emit};
-    const BASE: ProgressSignature = (3, 7, 12, 0, 30_000);
+    const BASE: ProgressSignature = (3, 7, 12, 0, 30_000, 1);
     #[test]
     fn token_only_change_emits() {
-        let cur: ProgressSignature = (3, 7, 12, 0, 45_000);
+        let cur: ProgressSignature = (3, 7, 12, 0, 45_000, 1);
+        assert!(progress_tick_should_emit(BASE, cur, false));
+    }
+    #[test]
+    fn assistant_message_only_change_emits() {
+        let cur: ProgressSignature = (3, 7, 12, 0, 30_000, 2);
         assert!(progress_tick_should_emit(BASE, cur, false));
     }
     #[test]
@@ -2466,6 +2475,20 @@ pub(crate) fn read_subagent_output(dir: &Path) -> Option<String> {
     let data = std::fs::read_to_string(dir.join("output.json")).ok()?;
     let file: OutputFile = serde_json::from_str(&data).ok()?;
     (file.schema_version == SUBAGENT_OUTPUT_SCHEMA_VERSION).then_some(file.output)
+}
+/// Read one child's output without allowing its id to escape the parent session directory.
+pub(crate) fn read_persisted_subagent_output(
+    parent_session_dir: &Path,
+    subagent_id: &str,
+) -> Option<String> {
+    if subagent_id.is_empty()
+        || subagent_id == "."
+        || subagent_id == ".."
+        || subagent_id.contains(['/', '\\'])
+    {
+        return None;
+    }
+    read_subagent_output(&parent_session_dir.join("subagents").join(subagent_id))
 }
 /// Extra runtime context for GCS artifact upload. `SubagentMeta` doesn't
 /// persist these fields, so they're carried from the spawn site.

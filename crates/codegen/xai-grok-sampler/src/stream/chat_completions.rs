@@ -378,9 +378,11 @@ pub fn stream_chat_completions<'a>(
                     }
                 }
 
-                if let Some(thought) = delta.reasoning_content
-                    && !thought.is_empty()
-                {
+                let reasoning_delta = delta
+                    .reasoning_content
+                    .filter(|thought| !thought.is_empty())
+                    .or_else(|| delta.reasoning.filter(|thought| !thought.is_empty()));
+                if let Some(thought) = reasoning_delta {
                     if !first_token_emitted {
                         first_token_emitted = true;
                         yield SamplingEvent::FirstToken {
@@ -409,12 +411,16 @@ pub fn stream_chat_completions<'a>(
                     let mut name_for_event: Option<String> = None;
                     let mut args_for_event: Option<String> = None;
 
-                    if let Some(id) = tc_delta.id {
+                    if let Some(id) = tc_delta.id
+                        && !id.trim().is_empty()
+                    {
                         entry.0 = id.clone();
                         id_for_event = Some(id);
                     }
                     if let Some(func) = tc_delta.function {
-                        if let Some(name) = func.name {
+                        if let Some(name) = func.name
+                            && !name.trim().is_empty()
+                        {
                             entry.1 = name.clone();
                             name_for_event = Some(name);
                         }
@@ -424,13 +430,18 @@ pub fn stream_chat_completions<'a>(
                         }
                     }
 
-                    yield SamplingEvent::ToolCallDelta {
-                        request_id: request_id.clone(),
-                        tool_index: tc_delta.index,
-                        id: id_for_event,
-                        name: name_for_event,
-                        arguments_delta: args_for_event,
-                    };
+                    if id_for_event.is_some()
+                        || name_for_event.is_some()
+                        || args_for_event.is_some()
+                    {
+                        yield SamplingEvent::ToolCallDelta {
+                            request_id: request_id.clone(),
+                            tool_index: tc_delta.index,
+                            id: id_for_event,
+                            name: name_for_event,
+                            arguments_delta: args_for_event,
+                        };
+                    }
                 }
             }
 
@@ -449,6 +460,27 @@ pub fn stream_chat_completions<'a>(
         }
 
         // ── Build the final response ─────────────────────────────────
+        if let Some((tool_index, missing_field)) = tool_call_acc.iter().find_map(
+            |(tool_index, (id, name, _))| {
+                if id.trim().is_empty() {
+                    Some((*tool_index, "id"))
+                } else if name.trim().is_empty() {
+                    Some((*tool_index, "function name"))
+                } else {
+                    None
+                }
+            },
+        ) {
+            let err = SamplingError::serialization_message(format!(
+                "invalid Chat Completions tool call at index {tool_index}: missing {missing_field}"
+            ));
+            yield SamplingEvent::Failed {
+                request_id: request_id.clone(),
+                error: SamplingErrorInfo::from(&err),
+            };
+            return;
+        }
+
         let mut tool_calls: Vec<ToolCall> = tool_call_acc
             .into_values()
             .map(|(id, name, arguments)| ToolCall {
@@ -569,6 +601,7 @@ mod tests {
             role: Some(Role::Assistant),
             content: Some(text.to_string()),
             reasoning_content: None,
+            reasoning: None,
             tool_calls: vec![],
             tool_call_id: None,
         }])
@@ -661,6 +694,7 @@ mod tests {
             role: Some(Role::Assistant),
             content: None,
             reasoning_content: Some("thinking...".into()),
+            reasoning: None,
             tool_calls: vec![],
             tool_call_id: None,
         }]);
@@ -719,12 +753,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_alias_stream_emits_reasoning_channel() {
+        let mut value = serde_json::to_value(make_chunk(vec![ChatChunkDelta::default()])).unwrap();
+        value["choices"][0]["delta"]["reasoning_content"] = serde_json::Value::Null;
+        value["choices"][0]["delta"]["reasoning"] =
+            serde_json::Value::String("alias thinking...".into());
+        let chunk: ChatCompletionChunk = serde_json::from_value(value).unwrap();
+
+        let events = collect(stream_chat_completions(
+            stream::iter(vec![Ok(chunk)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SamplingEvent::ChannelToken {
+                channel: SamplingChannel::Reasoning,
+                text,
+                ..
+            } if text == "alias thinking..."
+        )));
+        let response = match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => response,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        let reasoning = response
+            .reasoning_items()
+            .next()
+            .expect("reasoning alias preserved");
+        let rs::SummaryPart::SummaryText(summary) = &reasoning.summary[0];
+        assert_eq!(summary.text, "alias thinking...");
+    }
+
+    #[tokio::test]
     async fn tool_call_stream_emits_deltas_and_assembles_final_call() {
         // First chunk has id + name + part of arguments.
         let chunk1 = make_chunk(vec![ChatChunkDelta {
             role: None,
             content: None,
             reasoning_content: None,
+            reasoning: None,
             tool_calls: vec![ChunkToolCallDelta {
                 index: 0,
                 id: Some("call_abc".into()),
@@ -741,6 +812,7 @@ mod tests {
             role: None,
             content: None,
             reasoning_content: None,
+            reasoning: None,
             tool_calls: vec![ChunkToolCallDelta {
                 index: 0,
                 id: None,
@@ -809,6 +881,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_call_stream_ignores_blank_id_and_name_deltas() {
+        let valid = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            reasoning: None,
+            tool_calls: vec![ChunkToolCallDelta {
+                index: 0,
+                id: Some("call_abc".into()),
+                kind: Some("function".into()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some("do_thing".into()),
+                    arguments: Some("{\"x\":".into()),
+                }),
+            }],
+            tool_call_id: None,
+        }]);
+        let blank = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            reasoning: None,
+            tool_calls: vec![ChunkToolCallDelta {
+                index: 0,
+                id: Some("  ".into()),
+                kind: None,
+                function: Some(ToolCallFunctionDelta {
+                    name: Some(String::new()),
+                    arguments: Some("1}".into()),
+                }),
+            }],
+            tool_call_id: None,
+        }]);
+
+        let events = collect(stream_chat_completions(
+            stream::iter(vec![Ok(valid), Ok(blank)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let blank_delta = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ToolCallDelta {
+                    id,
+                    name,
+                    arguments_delta: Some(arguments),
+                    ..
+                } if arguments == "1}" => Some((id, name)),
+                _ => None,
+            })
+            .next()
+            .expect("argument delta preserved");
+        assert_eq!(blank_delta, (&None, &None));
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls[0].id.as_ref(), "call_abc");
+                assert_eq!(calls[0].name, "do_thing");
+                assert_eq!(calls[0].arguments.as_ref(), "{\"x\":1}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_tool_call_fails_before_completion() {
+        for (id, name, missing_field) in [
+            (Some("call_abc"), None, "function name"),
+            (None, Some("do_thing"), "id"),
+        ] {
+            let chunk = make_chunk(vec![ChatChunkDelta {
+                role: None,
+                content: None,
+                reasoning_content: None,
+                reasoning: None,
+                tool_calls: vec![ChunkToolCallDelta {
+                    index: 0,
+                    id: id.map(str::to_owned),
+                    kind: Some("function".into()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: name.map(str::to_owned),
+                        arguments: Some("{}".into()),
+                    }),
+                }],
+                tool_call_id: None,
+            }]);
+
+            let events = collect(stream_chat_completions(
+                stream::iter(vec![Ok(chunk)]).boxed(),
+                None,
+                rid(),
+                Duration::from_secs(60),
+            ))
+            .await;
+
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, SamplingEvent::Completed { .. }))
+            );
+            match events.last().unwrap() {
+                SamplingEvent::Failed { error, .. } => {
+                    assert_eq!(error.kind, crate::events::SamplingErrorKind::Serialization);
+                    assert!(!error.is_retryable);
+                    assert!(error.message.contains(missing_field));
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_tool_arguments_recover_from_tagged_assistant_text() {
         let tagged = concat!(
             "Waiting...<tool_call>\n",
@@ -822,6 +1010,7 @@ mod tests {
             role: None,
             content: None,
             reasoning_content: None,
+            reasoning: None,
             tool_calls: vec![ChunkToolCallDelta {
                 index: 0,
                 id: Some("call_wait".into()),

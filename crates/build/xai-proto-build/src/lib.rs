@@ -168,9 +168,8 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output = fs::read_to_string(&dep_out).with_context(|| {
-                format!("failed to read protoc depfile {}", dep_out.display())
-            })?;
+            let output = fs::read_to_string(&dep_out)
+                .with_context(|| format!("failed to read protoc depfile {}", dep_out.display()))?;
 
             let mut lines = output.lines();
             let first_line = lines.next().context("protoc depfile is empty")?;
@@ -179,9 +178,7 @@ impl XaiProtoBuilder {
             let rem = first_line
                 .split_once(": ")
                 .map(|(_, deps)| deps)
-                .with_context(|| {
-                    format!("protoc depfile missing ': ' separator: {output:?}")
-                })?;
+                .with_context(|| format!("protoc depfile missing ': ' separator: {output:?}"))?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
                 let line = line.strip_suffix("\\").unwrap_or(line);

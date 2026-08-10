@@ -438,6 +438,14 @@ pub struct SessionSignals {
     /// Peak resident set size in bytes (monotonically increasing)
     #[serde(default)]
     pub peak_rss_bytes: u64,
+
+    // === Subagent Output ===
+    /// Truncated text of the most recent assistant message in this session.
+    /// Used by the progress publisher to surface child-agent output to the
+    /// parent. Capped at ~200 chars to keep SubagentProgress notifications
+    /// lightweight; this is a UI hint, not authoritative content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_message: Option<String>,
 }
 
 /// Events that can be sent to the signals actor.
@@ -449,6 +457,9 @@ pub enum SignalEvent {
     IncrementTurn,
     /// Record an assistant message (response completed)
     RecordAssistantMessage,
+    /// Record an assistant message with its truncated text content.
+    /// Used by the subagent progress publisher to surface child output.
+    RecordAssistantMessageWithContent(String),
 
     // === Tool Events ===
     /// Record a tool call with the tool name
@@ -642,6 +653,14 @@ impl SessionSignalsHandle {
     /// Record an assistant message (response completed).
     pub fn record_assistant_message(&self) {
         let _ = self.tx.send(SignalEvent::RecordAssistantMessage);
+    }
+
+    /// Record an assistant message with truncated text content.
+    /// Used by the subagent progress publisher to surface child output.
+    pub fn record_assistant_message_with_content(&self, content: String) {
+        let _ = self
+            .tx
+            .send(SignalEvent::RecordAssistantMessageWithContent(content));
     }
 
     /// Record successful turn completion (resets consecutive cancellations).
@@ -1186,6 +1205,10 @@ impl SessionSignalsActor {
                 }
                 SignalEvent::RecordAssistantMessage => {
                     self.signals.assistant_message_count += 1;
+                }
+                SignalEvent::RecordAssistantMessageWithContent(content) => {
+                    self.signals.assistant_message_count += 1;
+                    self.signals.last_agent_message = Some(content);
                 }
                 SignalEvent::RecordTurnComplete => {
                     // Reset consecutive cancellations on successful turn

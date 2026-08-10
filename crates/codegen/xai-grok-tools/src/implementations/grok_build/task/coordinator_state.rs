@@ -30,6 +30,8 @@ pub struct SubagentProgress {
     pub context_usage_pct: u8,
     pub tools_used: Vec<String>,
     pub error_count: u32,
+    /// Truncated text of the child's most recent assistant message.
+    pub last_agent_message: Option<String>,
 }
 
 /// Runtime handle retained while a child is active.

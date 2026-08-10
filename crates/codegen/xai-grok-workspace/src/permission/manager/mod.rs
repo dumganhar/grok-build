@@ -1874,10 +1874,7 @@ fn spawn_permission_manager_with_pin(
                     // and classifier Allows would bypass the host's per-call
                     // confirmation, and classifier denials should become a host
                     // decision under a policy-governed turn, not a silent deny.
-                    if auto_mode
-                        && !turn_force_confirm
-                        && preflight.admits_auto_classifier()
-                    {
+                    if auto_mode && !turn_force_confirm && preflight.admits_auto_classifier() {
                         use crate::permission::auto_mode::{
                             AutoFastPath, access_requires_user_interaction, auto_mode_fast_path,
                         };

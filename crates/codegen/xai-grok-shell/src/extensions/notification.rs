@@ -720,6 +720,10 @@ pub enum SessionUpdate {
         tools_used: Vec<String>,
         /// Number of errors encountered so far.
         error_count: u32,
+        /// Truncated text of the child session's most recent assistant message.
+        /// Omitted when no assistant response has been recorded yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_agent_message: Option<String>,
     },
     /// A subagent session has finished (success, failure, or cancellation).
     ///
@@ -1565,6 +1569,7 @@ mod tests {
             context_usage_pct: 35,
             tools_used: vec!["bash".into(), "grep".into()],
             error_count: 1,
+            last_agent_message: None,
         };
         let json = serde_json::to_value(&update).unwrap();
         assert_eq!(json["sessionUpdate"], "subagent_progress");
@@ -1597,6 +1602,7 @@ mod tests {
             context_usage_pct: 1,
             tools_used: vec![],
             error_count: 0,
+            last_agent_message: None,
         };
         let json_str = serde_json::to_string(&update).unwrap();
         let parsed: SessionUpdate = serde_json::from_str(&json_str).unwrap();
@@ -1637,6 +1643,7 @@ mod tests {
             context_usage_pct: 0,
             tools_used: vec![],
             error_count: 0,
+            last_agent_message: None,
         })
         .unwrap();
         let finished = serde_json::to_value(SessionUpdate::SubagentFinished {

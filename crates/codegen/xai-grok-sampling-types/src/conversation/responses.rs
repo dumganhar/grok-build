@@ -2,6 +2,31 @@
 
 use super::*;
 
+const REASONING_SUMMARY_ENV: &str = "GROK_REASONING_SUMMARY";
+
+fn parse_reasoning_summary(value: &str) -> Option<rs::ReasoningSummary> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(rs::ReasoningSummary::Auto),
+        "concise" => Some(rs::ReasoningSummary::Concise),
+        "detailed" => Some(rs::ReasoningSummary::Detailed),
+        _ => None,
+    }
+}
+
+fn configured_reasoning_summary() -> rs::ReasoningSummary {
+    let Ok(value) = std::env::var(REASONING_SUMMARY_ENV) else {
+        return rs::ReasoningSummary::Concise;
+    };
+    parse_reasoning_summary(&value).unwrap_or_else(|| {
+        tracing::warn!(
+            env = REASONING_SUMMARY_ENV,
+            value,
+            "invalid reasoning summary mode; using concise"
+        );
+        rs::ReasoningSummary::Concise
+    })
+}
+
 /// Flatten `response.output` into `ConversationItem`s, preserving emission
 /// order. Replaying that order byte for byte on the next turn is what keeps
 /// the server-side prefix cache hot.
@@ -142,7 +167,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             prompt_cache_retention: None,
             reasoning: Some(rs::Reasoning {
                 effort: req.reasoning_effort.map(|e| e.to_responses_api()),
-                summary: Some(rs::ReasoningSummary::Concise),
+                summary: Some(configured_reasoning_summary()),
             }),
             safety_identifier: None,
             service_tier: req.service_tier,
@@ -192,6 +217,28 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
                     .or_insert_with(|| serde_json::Value::String("reasoning_text".into()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_reasoning_summary_modes() {
+        assert_eq!(
+            parse_reasoning_summary(" auto "),
+            Some(rs::ReasoningSummary::Auto)
+        );
+        assert_eq!(
+            parse_reasoning_summary("CONCISE"),
+            Some(rs::ReasoningSummary::Concise)
+        );
+        assert_eq!(
+            parse_reasoning_summary("detailed"),
+            Some(rs::ReasoningSummary::Detailed)
+        );
+        assert_eq!(parse_reasoning_summary("full"), None);
     }
 }
 

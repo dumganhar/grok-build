@@ -1399,9 +1399,33 @@ impl SessionActor {
         }
     }
     pub(super) async fn record_assistant_response(&self, assistant_item: ConversationItem) {
-        self.signals_handle().record_assistant_message();
         if let ConversationItem::Assistant(ref a) = assistant_item {
             tracing::info!(model_id = ?a.model_id, "DEBUG record_assistant_response model_id");
+            // Record message content for subagent progress reporting.
+            // Truncate to keep SubagentProgress notifications lightweight.
+            let text = a.content.trim();
+            if text.is_empty() {
+                self.signals_handle().record_assistant_message();
+            } else {
+                const MAX_LEN: usize = 200;
+                let truncated = if text.len() > MAX_LEN {
+                    format!(
+                        "{}…",
+                        &text[..text
+                            .char_indices()
+                            .take_while(|(i, _)| *i < MAX_LEN)
+                            .last()
+                            .map(|(i, c)| i + c.len_utf8())
+                            .unwrap_or(0)]
+                    )
+                } else {
+                    text.to_string()
+                };
+                self.signals_handle()
+                    .record_assistant_message_with_content(truncated);
+            }
+        } else {
+            self.signals_handle().record_assistant_message();
         }
         if let ConversationItem::Assistant(ref a) = assistant_item
             && let Some(first_call) = a.tool_calls.first()

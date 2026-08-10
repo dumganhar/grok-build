@@ -26,6 +26,7 @@ impl ChildControl for TestControl {
             context_usage_pct: 10,
             tools_used: vec!["read_file".to_owned()],
             error_count: 0,
+            last_agent_message: None,
         })
     }
 
