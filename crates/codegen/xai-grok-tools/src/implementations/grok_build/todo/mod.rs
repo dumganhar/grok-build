@@ -169,12 +169,7 @@ impl TodoState {
         self.todos.clear();
     }
 
-    pub fn update(
-        &mut self,
-        id: &TodoId,
-        content: Option<&str>,
-        status: Option<TodoStatus>,
-    ) -> bool {
+    pub fn update(&mut self, id: &str, content: Option<&str>, status: Option<TodoStatus>) -> bool {
         let Some(todo) = self.todos.get_mut(id) else {
             return false;
         };
@@ -203,6 +198,122 @@ impl TodoState {
 
     pub fn has_id(&self, id: &str) -> bool {
         self.todos.contains_key(id)
+    }
+
+    pub fn status(&self, id: &str) -> Option<TodoStatus> {
+        self.todos.get(id).map(|todo| todo.status)
+    }
+}
+
+/// Durable ownership of Todo work items by confirmed-running subagents.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentTodoBindings {
+    #[serde(default)]
+    next_generation: u64,
+    bindings: IndexMap<TodoId, SubagentTodoBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SubagentTodoBinding {
+    subagent_id: String,
+    generation: u64,
+    active: bool,
+}
+
+crate::register_resource!("grok_build", "SubagentTodoBindings", SubagentTodoBindings);
+
+impl SubagentTodoBindings {
+    /// Bind a confirmed-running child and mark its Todo in progress.
+    pub fn start(
+        &mut self,
+        todos: &mut TodoState,
+        todo_id: &str,
+        subagent_id: &str,
+    ) -> Option<u64> {
+        if !todos.has_id(todo_id) {
+            return None;
+        }
+        self.next_generation = self.next_generation.saturating_add(1).max(1);
+        let generation = self.next_generation;
+        self.bindings.insert(
+            todo_id.to_owned(),
+            SubagentTodoBinding {
+                subagent_id: subagent_id.to_owned(),
+                generation,
+                active: true,
+            },
+        );
+        todos.update(todo_id, None, Some(TodoStatus::InProgress));
+        Some(generation)
+    }
+
+    /// Restore a persisted binding. Newer generations win regardless of the
+    /// order orphan metadata is replayed.
+    pub fn restore(
+        &mut self,
+        todos: &mut TodoState,
+        todo_id: &str,
+        subagent_id: &str,
+        generation: u64,
+    ) -> bool {
+        if !todos.has_id(todo_id) {
+            return false;
+        }
+        match self.bindings.get(todo_id) {
+            Some(binding) if binding.generation >= generation => false,
+            Some(_) | None => {
+                self.next_generation = self.next_generation.max(generation);
+                self.bindings.insert(
+                    todo_id.to_owned(),
+                    SubagentTodoBinding {
+                        subagent_id: subagent_id.to_owned(),
+                        generation,
+                        active: true,
+                    },
+                );
+                todos.update(todo_id, None, Some(TodoStatus::InProgress));
+                true
+            }
+        }
+    }
+
+    /// Apply a terminal result only when this child is still the current owner.
+    pub fn finish(&mut self, todos: &mut TodoState, subagent_id: &str, completed: bool) -> bool {
+        let Some((todo_id, binding)) = self
+            .bindings
+            .iter_mut()
+            .find(|(_, binding)| binding.subagent_id == subagent_id && binding.active)
+        else {
+            return false;
+        };
+        binding.active = false;
+        if completed {
+            todos.update(todo_id, None, Some(TodoStatus::Completed));
+        } else {
+            todos.update(todo_id, None, Some(TodoStatus::Pending));
+        }
+        true
+    }
+
+    pub fn todo_ids(&self) -> impl Iterator<Item = &TodoId> {
+        self.bindings
+            .iter()
+            .filter_map(|(todo_id, binding)| binding.active.then_some(todo_id))
+    }
+
+    pub fn owns_subagent(&self, subagent_id: &str) -> bool {
+        self.bindings
+            .values()
+            .any(|binding| binding.active && binding.subagent_id == subagent_id)
+    }
+
+    pub fn reconcile_todos(&mut self, todos: &mut TodoState) {
+        self.bindings.retain(|todo_id, _| todos.has_id(todo_id));
+        for (todo_id, binding) in &self.bindings {
+            if binding.active {
+                todos.update(todo_id, None, Some(TodoStatus::InProgress));
+            }
+        }
     }
 }
 
@@ -329,7 +440,7 @@ impl xai_tool_runtime::Tool for TodoWriteTool {
         let (summary_for_prompt, todos, state_snapshot);
         {
             let mut res = resources.lock().await;
-            let todo_state = res.get_or_default::<State<TodoState>>();
+            let mut todo_state = res.get::<State<TodoState>>().cloned().unwrap_or_default();
 
             // Auto-upgrade to merge when the model forgot `merge: true` but
             // clearly intended a partial update: state already has items and
@@ -348,9 +459,13 @@ impl xai_tool_runtime::Tool for TodoWriteTool {
                 apply_replace(&mut todo_state.0, &input.todos)?;
             }
 
+            res.get_or_default::<State<SubagentTodoBindings>>()
+                .0
+                .reconcile_todos(&mut todo_state.0);
             summary_for_prompt = summarize_todo_state(&todo_state.0);
             todos = todo_state.0.todo_items().cloned().collect::<Vec<_>>();
             state_snapshot = todo_state.0.clone();
+            res.insert(todo_state);
         }
 
         Ok(TodoWriteOutput::TodosUpdated(TodoWriteSuccess {
@@ -654,6 +769,128 @@ mod tests {
             .find(|(i, _)| *i == id)
             .map(|(_, item)| item)
             .unwrap_or_else(|| panic!("item {id} not found in state"))
+    }
+
+    #[test]
+    fn subagent_binding_tracks_success_failure_and_retry_ownership() {
+        let mut todos = seed_state(&[("work", "Do work", TodoStatus::Pending)]);
+        let mut bindings = SubagentTodoBindings::default();
+
+        assert_eq!(bindings.start(&mut todos, "work", "run-1"), Some(1));
+        assert_eq!(todos.status("work"), Some(TodoStatus::InProgress));
+        assert!(bindings.owns_subagent("run-1"));
+
+        assert_eq!(bindings.start(&mut todos, "work", "run-2"), Some(2));
+        assert!(!bindings.finish(&mut todos, "run-1", true));
+        assert_eq!(todos.status("work"), Some(TodoStatus::InProgress));
+
+        todos.update("work", None, Some(TodoStatus::Completed));
+        bindings.reconcile_todos(&mut todos);
+        assert_eq!(todos.status("work"), Some(TodoStatus::InProgress));
+        assert!(bindings.finish(&mut todos, "run-2", false));
+        assert_eq!(todos.status("work"), Some(TodoStatus::Pending));
+        assert!(!bindings.finish(&mut todos, "run-1", true));
+        assert_eq!(todos.status("work"), Some(TodoStatus::Pending));
+
+        assert_eq!(bindings.start(&mut todos, "work", "run-3"), Some(3));
+        assert!(bindings.finish(&mut todos, "run-3", true));
+        assert_eq!(todos.status("work"), Some(TodoStatus::Completed));
+    }
+
+    #[test]
+    fn subagent_binding_rejects_unknown_todo_and_restores_legacy_state() {
+        let mut todos = seed_state(&[("work", "Do work", TodoStatus::Pending)]);
+        let mut bindings = SubagentTodoBindings::default();
+        let mut missing = todos.clone();
+        assert_eq!(bindings.start(&mut missing, "missing", "run"), None);
+        assert!(bindings.restore(&mut todos, "work", "newer-run", 2));
+        assert!(bindings.owns_subagent("newer-run"));
+        assert!(!bindings.restore(&mut todos, "work", "older-run", 1));
+        assert!(bindings.owns_subagent("newer-run"));
+    }
+
+    #[test]
+    fn subagent_bindings_serialize_with_todo_state() {
+        let mut resources = Resources::new();
+        resources.register_state::<TodoState>();
+        resources.register_state::<SubagentTodoBindings>();
+        let mut todos = seed_state(&[("work", "Do work", TodoStatus::Pending)]);
+        let mut bindings = SubagentTodoBindings::default();
+        assert_eq!(bindings.start(&mut todos, "work", "run"), Some(1));
+        resources.insert(State(todos));
+        resources.insert(State(bindings));
+
+        let snapshot = resources.serialize();
+        assert!(snapshot["state"].get("grok_build.Todo").is_some());
+        assert!(
+            snapshot["state"]
+                .get("grok_build.SubagentTodoBindings")
+                .is_some()
+        );
+
+        let mut restored = Resources::new();
+        restored.register_state::<TodoState>();
+        restored.register_state::<SubagentTodoBindings>();
+        restored.load_from(serde_json::from_value(snapshot).unwrap());
+        assert!(
+            restored
+                .get::<State<SubagentTodoBindings>>()
+                .unwrap()
+                .0
+                .owns_subagent("run")
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_write_preserves_active_binding_and_prunes_deleted_todo() {
+        let tool = TodoWriteTool;
+        let mut resources = Resources::new();
+        let mut todos = seed_state(&[
+            ("work", "Do work", TodoStatus::Pending),
+            ("keep", "Keep this", TodoStatus::Pending),
+        ]);
+        let mut bindings = SubagentTodoBindings::default();
+        assert_eq!(bindings.start(&mut todos, "work", "run"), Some(1));
+        resources.insert(State(todos));
+        resources.insert(State(bindings));
+        let shared = resources.into_shared();
+
+        let output = expect_success(
+            xai_tool_runtime::Tool::run(
+                &tool,
+                test_ctx(shared.clone()),
+                TodoWriteInput {
+                    merge: true,
+                    todos: vec![make_update("work", None, Some(TodoStatus::Completed))],
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(output.state.status("work"), Some(TodoStatus::InProgress));
+
+        xai_tool_runtime::Tool::run(
+            &tool,
+            test_ctx(shared.clone()),
+            TodoWriteInput {
+                merge: false,
+                todos: vec![make_update(
+                    "keep",
+                    Some("Keep this"),
+                    Some(TodoStatus::Pending),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+        let resources = shared.lock().await;
+        assert!(
+            !resources
+                .get::<State<SubagentTodoBindings>>()
+                .unwrap()
+                .0
+                .owns_subagent("run")
+        );
     }
 
     // ── replace (merge=false) ────────────────────────────────────────

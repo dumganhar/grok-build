@@ -154,6 +154,8 @@ fn collected_from(
     CollectedTodoGateInput {
         todos,
         backing_task_count,
+        bound_todo_ids: Default::default(),
+        unbound_backing_task_count: backing_task_count,
     }
 }
 

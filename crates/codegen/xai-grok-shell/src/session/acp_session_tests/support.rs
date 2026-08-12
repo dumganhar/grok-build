@@ -24,6 +24,21 @@ pub(crate) async fn test_agent_default() -> xai_grok_agent::Agent {
     test_agent_with_tools(vec![]).await
 }
 #[cfg(test)]
+pub(crate) async fn test_agent_default_with_state_path(
+    state_path: std::path::PathBuf,
+) -> xai_grok_agent::Agent {
+    test_agent_from_config_with_state_path(
+        xai_grok_tools::registry::types::ToolServerConfig {
+            tools: vec![],
+            behavior_preset: None,
+        },
+        xai_grok_agent::AgentDefinition::default_grok_build(),
+        std::sync::Arc::new(xai_grok_tools::computer::local::LocalTerminalBackend::new()),
+        state_path,
+    )
+    .await
+}
+#[cfg(test)]
 pub(crate) async fn test_agent_backend_search(
     hosted_tools: Vec<xai_grok_sampling_types::HostedTool>,
 ) -> xai_grok_agent::Agent {
@@ -107,6 +122,21 @@ async fn test_agent_from_config(
     definition: xai_grok_agent::AgentDefinition,
     backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>,
 ) -> xai_grok_agent::Agent {
+    test_agent_from_config_with_state_path(
+        config,
+        definition,
+        backend,
+        std::path::PathBuf::from("/tmp/tool_state.json"),
+    )
+    .await
+}
+#[cfg(test)]
+async fn test_agent_from_config_with_state_path(
+    config: xai_grok_tools::registry::types::ToolServerConfig,
+    definition: xai_grok_agent::AgentDefinition,
+    backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend>,
+    state_path: std::path::PathBuf,
+) -> xai_grok_agent::Agent {
     use xai_grok_tools::computer::local::LocalFs;
     use xai_grok_tools::computer::types::AsyncFileSystem;
     use xai_grok_tools::notification::ToolNotificationHandle;
@@ -124,7 +154,7 @@ async fn test_agent_from_config(
         subagent: None,
         parent_scheduler_handle: None,
         skills: vec![],
-        state_path: std::path::PathBuf::from("/tmp/tool_state.json"),
+        state_path,
         memory_backend: None,
         web_search_config: Default::default(),
         web_fetch_config: Default::default(),

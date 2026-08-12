@@ -599,6 +599,101 @@ impl SessionActor {
             "agentTimestampMs": agent_timestamp_ms,
         })
     }
+    async fn mutate_subagent_todo<T>(
+        &self,
+        publish_plan: bool,
+        durable_required: bool,
+        mutate: impl FnOnce(
+            &mut xai_grok_tools::implementations::grok_build::todo::SubagentTodoBindings,
+            &mut crate::tools::todo::TodoState,
+        ) -> Option<T>,
+    ) -> Option<T> {
+        use crate::tools::todo::plan_entry_from_todo_item;
+        use xai_grok_tools::implementations::grok_build::todo::SubagentTodoBindings;
+        use xai_grok_tools::types::resources::State;
+
+        let bridge = self.tool_bridge_handle();
+        let resources = bridge.shared_resources().await;
+        let mut resources = resources.lock().await;
+        let original_todos = resources
+            .get::<State<crate::tools::todo::TodoState>>()
+            .cloned()
+            .unwrap_or_default();
+        let original_bindings = resources
+            .get::<State<SubagentTodoBindings>>()
+            .cloned()
+            .unwrap_or_default();
+        let mut todos = original_todos.clone();
+        let mut bindings = original_bindings.clone();
+        let result = mutate(&mut bindings.0, &mut todos.0)?;
+        let entries = todos
+            .0
+            .todo_items()
+            .cloned()
+            .map(plan_entry_from_todo_item)
+            .collect::<Vec<_>>();
+        resources.insert(todos);
+        resources.insert(bindings);
+        let snapshot = resources.serialize();
+        let persisted = bridge
+            .toolset()
+            .try_save_snapshot_and_flush_persistence(snapshot)
+            .await
+            .map(|_| true)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    ?error,
+                    "failed to durably persist Subagent Todo lifecycle state"
+                );
+                false
+            });
+        if !persisted && durable_required {
+            resources.insert(original_todos);
+            resources.insert(original_bindings);
+            return None;
+        }
+        drop(resources);
+        if publish_plan {
+            self.send_update(acp::SessionUpdate::Plan(acp::Plan::new(entries)), None)
+                .await;
+        }
+        Some(result)
+    }
+
+    pub(super) async fn mark_subagent_todo_started(
+        &self,
+        todo_id: &str,
+        subagent_id: &str,
+    ) -> Option<u64> {
+        self.mutate_subagent_todo(true, true, |bindings, todos| {
+            bindings.start(todos, todo_id, subagent_id)
+        })
+        .await
+    }
+
+    pub(super) async fn restore_subagent_todo_binding(
+        &self,
+        todo_id: &str,
+        subagent_id: &str,
+        generation: u64,
+    ) {
+        let _ = self
+            .mutate_subagent_todo(false, false, |bindings, todos| {
+                bindings
+                    .restore(todos, todo_id, subagent_id, generation)
+                    .then_some(())
+            })
+            .await;
+    }
+
+    pub(super) async fn finish_subagent_todo(&self, subagent_id: &str, completed: bool) {
+        let _ = self
+            .mutate_subagent_todo(true, false, |bindings, todos| {
+                bindings.finish(todos, subagent_id, completed).then_some(())
+            })
+            .await;
+    }
+
     /// Handle xAI session notifications - store them in persistence
     /// These are client-side events (like diff reviews) that should be part of session history.
     /// Exception: `SubagentProgress` ticks are transient and return before the store.

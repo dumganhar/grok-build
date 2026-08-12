@@ -327,6 +327,8 @@ fn resumed_from_field_in_meta_roundtrips() {
     let meta = SubagentMeta {
         subagent_id: "sa-resumed".into(),
         parent_session_id: "parent".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child".into(),
         subagent_type: "general-purpose".into(),
         description: "resumed task".into(),
@@ -374,6 +376,8 @@ fn resumed_from_none_not_serialized_in_meta() {
     let meta = SubagentMeta {
         subagent_id: "sa-fresh".into(),
         parent_session_id: "p".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "c".into(),
         subagent_type: "explore".into(),
         description: "d".into(),
@@ -415,12 +419,27 @@ fn backward_compat_meta_without_resumed_from() {
         }"#;
     let meta: SubagentMeta = serde_json::from_str(json).unwrap();
     assert!(meta.resumed_from.is_none());
+    assert!(meta.todo_id.is_none());
+    assert!(meta.todo_generation.is_none());
+}
+
+#[test]
+fn todo_id_field_in_meta_roundtrips() {
+    let mut meta = snapshot_test_meta("todo-bound");
+    meta.todo_id = Some("task-5".into());
+    meta.todo_generation = Some(7);
+    let json = serde_json::to_string(&meta).unwrap();
+    let parsed: SubagentMeta = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.todo_id.as_deref(), Some("task-5"));
+    assert_eq!(parsed.todo_generation, Some(7));
 }
 #[test]
 fn snapshot_ref_field_in_meta_roundtrips() {
     let meta = SubagentMeta {
         subagent_id: "sa-snap".into(),
         parent_session_id: "parent".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child".into(),
         subagent_type: "general-purpose".into(),
         description: "snapshot task".into(),
@@ -471,6 +490,8 @@ fn snapshot_test_meta(id: &str) -> SubagentMeta {
     SubagentMeta {
         subagent_id: id.into(),
         parent_session_id: "session-A".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: format!("child-{id}"),
         subagent_type: "general-purpose".into(),
         description: "task".into(),
@@ -666,6 +687,8 @@ fn subagent_session_metadata_roundtrip() {
     let meta = SubagentMeta {
         subagent_id: "sa-1".into(),
         parent_session_id: "parent-1".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child-1".into(),
         subagent_type: "general-purpose".into(),
         description: "test task".into(),
@@ -726,6 +749,8 @@ fn subagent_session_metadata_non_forked() {
     let meta = SubagentMeta {
         subagent_id: "sa-2".into(),
         parent_session_id: "parent-2".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child-2".into(),
         subagent_type: "explore".into(),
         description: "search code".into(),
@@ -790,6 +815,8 @@ fn upload_lifecycle_spawn_then_completion_preserves_fields() {
     let spawn_meta = SubagentMeta {
         subagent_id: "sa-lifecycle".into(),
         parent_session_id: "parent-1".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child-1".into(),
         subagent_type: "general-purpose".into(),
         description: "test task".into(),
@@ -873,6 +900,8 @@ fn upload_lifecycle_failure_preserves_error() {
     let meta = SubagentMeta {
         subagent_id: "sa-fail".into(),
         parent_session_id: "p".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "c".into(),
         subagent_type: "explore".into(),
         description: "d".into(),
@@ -921,6 +950,8 @@ fn session_metadata_session_kind_for_resumed() {
     let meta = SubagentMeta {
         subagent_id: "sa-resume".into(),
         parent_session_id: "p".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "c".into(),
         subagent_type: "general-purpose".into(),
         description: "d".into(),
@@ -1214,6 +1245,8 @@ fn durable_fallback_roundtrips_child_cwd_and_worktree() {
     let meta = SubagentMeta {
         subagent_id: "sa-dur".into(),
         parent_session_id: "parent-dur".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child-dur".into(),
         subagent_type: "general-purpose".into(),
         description: "d".into(),
@@ -1253,6 +1286,8 @@ fn durable_fallback_rejects_running_status() {
     let meta = SubagentMeta {
         subagent_id: "sa-running".into(),
         parent_session_id: "parent-x".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child-running".into(),
         subagent_type: "explore".into(),
         description: "d".into(),
@@ -1335,6 +1370,8 @@ fn running_test_meta(id: &str, parent_session_id: &str) -> SubagentMeta {
     SubagentMeta {
         subagent_id: id.into(),
         parent_session_id: parent_session_id.into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: format!("child-{id}"),
         subagent_type: "explore".into(),
         description: "task".into(),
@@ -1441,7 +1478,11 @@ async fn reconcile_orphan_skips_shared_actor_live_child() {
     let session_dir = tempfile::TempDir::new().unwrap();
     let id = "sa-live";
     let sub_dir = session_dir.path().join("subagents").join(id);
-    write_subagent_meta(&sub_dir, &running_test_meta(id, "parent-x"));
+    let mut meta = running_test_meta(id, "parent-x");
+    meta.todo_id = Some("work".into());
+    meta.todo_generation = Some(3);
+    write_subagent_meta(&sub_dir, &meta);
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     reconcile_with_inspections(
             &[],
             HashMap::from([
@@ -1452,7 +1493,7 @@ async fn reconcile_orphan_skips_shared_actor_live_child() {
             ]),
             session_dir.path(),
             &test_gateway(),
-            None,
+            Some(&cmd_tx),
         )
         .await;
     let reread: SubagentMeta = serde_json::from_str(
@@ -1460,6 +1501,15 @@ async fn reconcile_orphan_skips_shared_actor_live_child() {
         )
         .unwrap();
     assert_eq!(reread.status, "running");
+    assert!(matches!(
+        cmd_rx.try_recv(),
+        Ok(SessionCommand::SubagentTodoRestore {
+            todo_id,
+            subagent_id,
+            generation: 3,
+        }) if todo_id == "work" && subagent_id == id
+    ));
+    assert!(cmd_rx.try_recv().is_err());
 }
 #[tokio::test]
 async fn reconcile_reemits_shared_actor_terminal_outcome() {
@@ -1525,6 +1575,102 @@ async fn reconcile_dedups_replay_and_running_meta_sources() {
         )
         .await;
     assert_eq!(drain_cancelled_finish_cmds(&mut cmd_rx, id), 1);
+}
+
+#[tokio::test]
+async fn reconcile_terminal_meta_repairs_todo_without_reemitting_finish() {
+    let session_dir = tempfile::TempDir::new().unwrap();
+    let id = "sa-terminal";
+    let sub_dir = session_dir.path().join("subagents").join(id);
+    let mut meta = running_test_meta(id, "parent-x");
+    meta.status = "completed".into();
+    meta.todo_id = Some("work".into());
+    meta.todo_generation = Some(2);
+    write_subagent_meta(&sub_dir, &meta);
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+    reconcile_with_inspections(
+        &[],
+        HashMap::new(),
+        session_dir.path(),
+        &test_gateway(),
+        Some(&cmd_tx),
+    )
+    .await;
+
+    assert!(matches!(
+        cmd_rx.try_recv(),
+        Ok(SessionCommand::SubagentTodoRestore {
+            todo_id,
+            subagent_id,
+            generation: 2,
+        }) if todo_id == "work" && subagent_id == id
+    ));
+    assert!(matches!(
+        cmd_rx.try_recv(),
+        Ok(SessionCommand::SubagentTodoFinished {
+            subagent_id,
+            completed: true,
+        }) if subagent_id == id
+    ));
+    assert!(cmd_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn reconcile_restores_all_generations_before_terminal_finishes() {
+    let session_dir = tempfile::TempDir::new().unwrap();
+    let old_id = "old-run";
+    let retry_id = "retry-run";
+    let mut old = running_test_meta(old_id, "parent-x");
+    old.status = "completed".into();
+    old.todo_id = Some("work".into());
+    old.todo_generation = Some(1);
+    write_subagent_meta(
+        &session_dir.path().join("subagents").join(old_id),
+        &old,
+    );
+    let mut retry = running_test_meta(retry_id, "parent-x");
+    retry.todo_id = Some("work".into());
+    retry.todo_generation = Some(2);
+    write_subagent_meta(
+        &session_dir.path().join("subagents").join(retry_id),
+        &retry,
+    );
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+
+    reconcile_with_inspections(
+        &[],
+        HashMap::from([(
+            retry_id.to_string(),
+            Some(inspection(
+                retry_id,
+                SubagentSnapshotStatus::Initializing,
+            )),
+        )]),
+        session_dir.path(),
+        &test_gateway(),
+        Some(&cmd_tx),
+    )
+    .await;
+
+    let first = cmd_rx.try_recv().unwrap();
+    let second = cmd_rx.try_recv().unwrap();
+    let generations = [first, second]
+        .map(|command| match command {
+            SessionCommand::SubagentTodoRestore { generation, .. } => generation,
+            _ => panic!("expected restore before any finish"),
+        })
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(generations, std::collections::HashSet::from([1, 2]));
+    assert!(matches!(
+        cmd_rx.try_recv(),
+        Ok(SessionCommand::SubagentTodoFinished {
+            subagent_id,
+            completed: true,
+        }) if subagent_id == old_id
+    ));
+    assert!(cmd_rx.try_recv().is_err());
 }
 #[test]
 fn resume_rejects_conflicting_subagent_type() {
@@ -1611,6 +1757,8 @@ fn durable_meta_roundtrips_effective_model_id() {
     let meta = SubagentMeta {
         subagent_id: "sa-model".into(),
         parent_session_id: "parent".into(),
+        todo_id: None,
+        todo_generation: None,
         child_session_id: "child".into(),
         subagent_type: "general-purpose".into(),
         description: "d".into(),

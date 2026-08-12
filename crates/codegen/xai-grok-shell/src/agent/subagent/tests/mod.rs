@@ -97,7 +97,58 @@ async fn usage_ack_precedes_terminal_presentation() {
                     ..
                 }
             })
-        ));
+    ));
+}
+
+#[test]
+fn bound_completion_precedes_terminal_presentation_with_todo_update() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let (parent_cmd_tx, mut parent_cmd_rx) = mpsc::unbounded_channel();
+    ctx.parent_cmd_tx = Some(parent_cmd_tx);
+    let (gateway, _gateway_rx) = test_gateway_with_receiver();
+    let mut request = auto_wake_test_request("todo-order");
+    request.todo_id = Some("work".into());
+    request.run_in_background = false;
+    let mut completion_data = ShellCompletionData::from_context(&ctx);
+    completion_data.spawned_notification_emitted = true;
+
+    present_child_completion(
+        ChildCompletion {
+            request,
+            result: SubagentResult {
+                success: true,
+                subagent_id: "todo-order".to_string(),
+                child_session_id: "todo-order".to_string(),
+                ..Default::default()
+            },
+            completion_data,
+            disposition: CompletionDisposition {
+                foreground_delivered: true,
+                backgrounded: false,
+                waiter_delivered: false,
+                explicitly_killed: false,
+                should_surface: false,
+            },
+        },
+        &gateway,
+    );
+
+    assert!(matches!(
+        parent_cmd_rx.try_recv(),
+        Ok(SessionCommand::SubagentTodoFinished {
+            subagent_id,
+            completed: true,
+        }) if subagent_id == "todo-order"
+    ));
+    assert!(matches!(
+        parent_cmd_rx.try_recv(),
+        Ok(SessionCommand::XaiSessionNotification {
+            notification: SessionNotification {
+                update: SessionUpdate::SubagentFinished { .. },
+                ..
+            }
+        })
+    ));
 }
 /// Invariant: resolving a subagent applies the parent session's
 /// `--tools`/`--disallowed-tools`/`--permission-mode` — driven through
@@ -320,6 +371,7 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
         subagent_type: "general-purpose".into(),
         parent_session_id: "parent".into(),
         parent_prompt_id: None,
+        todo_id: None,
         resume_from: None,
         cwd: None,
         runtime_overrides: Default::default(),
@@ -1205,6 +1257,7 @@ fn bootstrap_test_request(fork_context: bool) -> SubagentRequest {
         subagent_type: "general-purpose".into(),
         parent_session_id: "parent".into(),
         parent_prompt_id: None,
+        todo_id: None,
         resume_from: None,
         cwd: None,
         runtime_overrides: Default::default(),

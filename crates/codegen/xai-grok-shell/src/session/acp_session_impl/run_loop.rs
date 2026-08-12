@@ -1156,6 +1156,37 @@ pub(super) async fn run_session(
                         SessionCommand::XaiSessionNotification { notification } => {
                             session.handle_xai_session_notification(notification).await;
                         }
+                        SessionCommand::SubagentTodoStarted {
+                            todo_id,
+                            subagent_id,
+                            respond_to,
+                        } => {
+                            let applied = session
+                                .mark_subagent_todo_started(&todo_id, &subagent_id)
+                                .await;
+                            let _ = respond_to.send(applied);
+                        }
+                        SessionCommand::SubagentTodoRestore {
+                            todo_id,
+                            subagent_id,
+                            generation,
+                        } => {
+                            session
+                                .restore_subagent_todo_binding(
+                                    &todo_id,
+                                    &subagent_id,
+                                    generation,
+                                )
+                                .await;
+                        }
+                        SessionCommand::SubagentTodoFinished {
+                            subagent_id,
+                            completed,
+                        } => {
+                            session
+                                .finish_subagent_todo(&subagent_id, completed)
+                                .await;
+                        }
                         SessionCommand::RecordSubagentUsage {
                             by_model,
                             parent_prompt_id,

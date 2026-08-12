@@ -556,6 +556,9 @@ pub(crate) async fn run_shell_child(
     let subagent_meta = SubagentMeta {
         subagent_id: subagent_id.clone(),
         parent_session_id: ctx.parent_session_id.clone(),
+        // Filled only after the parent durably confirms the binding.
+        todo_id: None,
+        todo_generation: None,
         child_session_id: child_session_id.0.to_string(),
         subagent_type: request.subagent_type.clone(),
         description: request.description.clone(),
@@ -1193,6 +1196,67 @@ pub(crate) async fn run_shell_child(
         )
         .await;
         return child_run_output(result, completion_data, None);
+    }
+    if let Some(todo_id) = request.todo_id.clone() {
+        let generation = if let Some(parent_cmd_tx) = ctx.parent_cmd_tx.as_ref() {
+            let (respond_to, response) = oneshot::channel();
+            if parent_cmd_tx
+                .send(SessionCommand::SubagentTodoStarted {
+                    todo_id: todo_id.clone(),
+                    subagent_id: request.id.clone(),
+                    respond_to,
+                })
+                .is_ok()
+            {
+                response.await.ok().flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let Some(generation) = generation else {
+            tracing::warn!(
+                subagent_id = %request.id,
+                todo_id,
+                "confirmed child could not bind its Todo; cancelling before prompt"
+            );
+            ctx.workspace_ops
+                .end_local_session(child_session_id.0.as_ref());
+            let result = cancel_pending_shell_child(
+                &child_handle.cmd_tx,
+                &subagent_id,
+                &child_session_id,
+                &subagent_meta_dir,
+                worktree_path.as_deref(),
+                worktree_freshly_created,
+                start.elapsed().as_millis() as u64,
+                &gcs_upload_ctx,
+            )
+            .await;
+            return child_run_output(result, completion_data, None);
+        };
+        if !update_subagent_meta_todo_binding(&subagent_meta_dir, &todo_id, generation) {
+            tracing::warn!(
+                subagent_id = %request.id,
+                todo_id,
+                "failed to persist confirmed Subagent Todo binding; cancelling before prompt"
+            );
+            ctx.workspace_ops
+                .end_local_session(child_session_id.0.as_ref());
+            let result = cancel_pending_shell_child(
+                &child_handle.cmd_tx,
+                &subagent_id,
+                &child_session_id,
+                &subagent_meta_dir,
+                worktree_path.as_deref(),
+                worktree_freshly_created,
+                start.elapsed().as_millis() as u64,
+                &gcs_upload_ctx,
+            )
+            .await;
+            return child_run_output(result, completion_data, None);
+        }
     }
     spawn_progress_publisher(
         child_handle.signals_handle.clone(),

@@ -248,6 +248,7 @@ impl crate::types::tool_metadata::ToolMetadata for TaskTool {
                     subagent_type_param: "${{ params.task.subagent_type }}",
                     run_in_background_param: "${{ params.task.run_in_background }}",
                     resume_from_param: "${{ params.task.resume_from }}",
+                    todo_id_param: "${{ params.task.todo_id }}",
                     background_retrieval_tool: "${{ tools.by_kind.background_task_action }}",
                     isolation_param: "${{ params.task.isolation }}",
                 },
@@ -309,8 +310,10 @@ impl xai_tool_runtime::Tool for TaskTool {
         ctx: xai_tool_runtime::ToolCallContext,
         input: TaskToolInput,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+        use crate::types::resources::State;
         use crate::types::tool_metadata::shared_resources;
         let resources = shared_resources(&ctx)?;
+        let todo_id = xai_tool_types::sanitize_optional_arg(input.todo_id.clone());
         let tool_cancellation = ctx
             .get::<xai_tool_runtime::Cancellation>()
             .map(|cancellation| cancellation.0.clone());
@@ -352,6 +355,16 @@ impl xai_tool_runtime::Tool for TaskTool {
                 .map(|p| p.0.clone())
                 .filter(|prompt_id| !prompt_id.is_empty());
             let foreground_wait = res.get::<SubagentForegroundWait>().cloned();
+
+            if let Some(todo_id) = todo_id.as_deref()
+                && !res
+                    .get::<State<crate::implementations::grok_build::todo::TodoState>>()
+                    .is_some_and(|state| state.0.has_id(todo_id))
+            {
+                return Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
+                    "Unknown Todo ID: {todo_id}. Create the Todo item before binding a subagent to it."
+                )));
+            }
 
             (
                 depth,
@@ -519,6 +532,7 @@ impl xai_tool_runtime::Tool for TaskTool {
             subagent_type: input.subagent_type.clone(),
             parent_session_id,
             parent_prompt_id,
+            todo_id,
             resume_from,
             cwd,
             runtime_overrides: SubagentRuntimeOverrides {
@@ -759,6 +773,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -792,6 +807,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -826,6 +842,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -857,6 +874,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -915,6 +933,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -971,6 +990,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -1014,6 +1034,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -1122,6 +1143,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            todo_id: None,
             task_id: None,
         }
     }
@@ -1134,6 +1156,60 @@ mod tests {
         resources.insert(CurrentPromptIdResource("prompt-123".to_string()));
         resources.insert(TaskModelValidator::new(|_| None));
         resources
+    }
+
+    fn todo_state(id: &str) -> crate::implementations::grok_build::todo::TodoState {
+        use crate::implementations::grok_build::todo::{
+            TodoItem, TodoPriority, TodoState, TodoStatus,
+        };
+        let mut state = TodoState::default();
+        state.push(
+            id.to_string(),
+            TodoItem {
+                content: "Bound work".to_string(),
+                priority: TodoPriority::Medium,
+                status: TodoStatus::Pending,
+                meta: None,
+            },
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn todo_id_must_reference_existing_todo() {
+        use crate::types::resources::State;
+        let (backend, mut rx) = make_backend();
+        let mut resources = resources_for_task(backend);
+        resources.insert(State(todo_state("known")));
+        let mut input = task_input("general-purpose", true);
+        input.todo_id = Some("missing".to_string());
+
+        let error =
+            xai_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("Unknown Todo ID: missing"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn valid_todo_id_is_forwarded_to_subagent_request() {
+        use crate::types::resources::State;
+        let (backend, mut rx) = make_backend();
+        let mut resources = resources_for_task(backend);
+        resources.insert(State(todo_state("work")));
+        let mut input = task_input("general-purpose", true);
+        input.todo_id = Some(" work ".to_string());
+
+        xai_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input)
+            .await
+            .unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .map(unwrap_spawn)
+            .unwrap();
+        assert_eq!(request.todo_id.as_deref(), Some("work"));
     }
 
     /// Seed `chat_history.jsonl` so leftover-parent detection can fire.
@@ -1663,6 +1739,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: Some("test-model".into()),
+            todo_id: Some("todo-7".into()),
             task_id: Some("task-123".into()),
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -1673,6 +1750,7 @@ mod tests {
             Some(SubagentCapabilityMode::ReadOnly)
         );
         assert_eq!(parsed.model.as_deref(), Some("test-model"));
+        assert_eq!(parsed.todo_id.as_deref(), Some("todo-7"));
     }
 
     #[test]
@@ -1933,6 +2011,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            todo_id: None,
             task_id: None,
         })
         .unwrap();
@@ -1982,6 +2061,7 @@ mod tests {
                 resume_from: None,
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2018,6 +2098,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            todo_id: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2064,6 +2145,7 @@ mod tests {
                 resume_from: Some("prev-id".into()),
                 cwd: None,
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2130,6 +2212,7 @@ mod tests {
                     resume_from: Some(sentinel.into()),
                     cwd: None,
                     model: None,
+                    todo_id: None,
                     task_id: None,
                 },
             )
@@ -2176,6 +2259,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            todo_id: None,
             task_id: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -2204,6 +2288,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2258,6 +2343,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2308,6 +2394,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("null".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2358,6 +2445,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("  ".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2411,6 +2499,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2445,6 +2534,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/nonexistent/path/that/does/not/exist".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2500,6 +2590,7 @@ mod tests {
                     resume_from: None,
                     cwd: Some(sentinel.into()),
                     model: None,
+                    todo_id: None,
                     task_id: None,
                 },
             )
@@ -2553,6 +2644,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2610,6 +2702,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("\"/tmp".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2662,6 +2755,7 @@ mod tests {
                 resume_from: None,
                 cwd: Some("/tmp".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )
@@ -2710,6 +2804,7 @@ mod tests {
                 resume_from: Some("prev-id".into()),
                 cwd: Some("/tmp/some-dir".into()),
                 model: None,
+                todo_id: None,
                 task_id: None,
             },
         )

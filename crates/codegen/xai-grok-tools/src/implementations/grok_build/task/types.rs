@@ -71,6 +71,8 @@ pub struct SubagentRequest {
     /// Used to cancel only the subagents spawned by the currently-cancelled turn,
     /// without affecting background subagents from earlier turns.
     pub parent_prompt_id: Option<String>,
+    /// Existing parent Todo item whose lifecycle this child owns.
+    pub todo_id: Option<String>,
     /// Resume from a previously completed subagent's conversation.
     /// Inherits raw transcript, tool state, and model. System prompt is
     /// freshly rendered.

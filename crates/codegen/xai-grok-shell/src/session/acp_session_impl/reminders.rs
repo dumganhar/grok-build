@@ -20,6 +20,11 @@ pub struct CollectedTodoGateInput {
     /// `|outstanding subagents| + |incomplete bash/monitor tasks|` at
     /// the moment of gate evaluation.
     pub backing_task_count: usize,
+    /// Todo IDs with an explicit confirmed-running Subagent owner.
+    pub bound_todo_ids: std::collections::HashSet<String>,
+    /// Remaining background work that can back unbound in-progress items via
+    /// the legacy insertion-order heuristic.
+    pub unbound_backing_task_count: usize,
 }
 impl CollectedTodoGateInput {
     /// Borrowed view used by [`evaluate_todo_gate`]. Pure transformation —
@@ -32,20 +37,26 @@ impl CollectedTodoGateInput {
     pub fn as_input(&self) -> TodoGateInput<'_> {
         use crate::tools::todo::TodoStatus;
         let mut pending = Vec::new();
-        let mut in_progress: Vec<&str> = Vec::new();
-        for (_, content, status) in &self.todos {
+        let mut in_progress_backed = Vec::new();
+        let mut in_progress_unbacked = Vec::new();
+        for (id, content, status) in &self.todos {
             match status {
                 TodoStatus::Pending => pending.push(content.as_str()),
-                TodoStatus::InProgress => in_progress.push(content.as_str()),
+                TodoStatus::InProgress if self.bound_todo_ids.contains(id) => {
+                    in_progress_backed.push(content.as_str());
+                }
+                TodoStatus::InProgress => in_progress_unbacked.push(content.as_str()),
                 TodoStatus::Completed | TodoStatus::Cancelled => {}
             }
         }
-        let backed_count = in_progress.len().min(self.backing_task_count);
-        let in_progress_unbacked = in_progress.split_off(backed_count);
-        let in_progress_backed = in_progress;
+        let backed_count = in_progress_unbacked
+            .len()
+            .min(self.unbound_backing_task_count);
+        let still_unbacked = in_progress_unbacked.split_off(backed_count);
+        in_progress_backed.extend(in_progress_unbacked);
         TodoGateInput {
             pending,
-            in_progress_unbacked,
+            in_progress_unbacked: still_unbacked,
             in_progress_backed,
             backing_task_count: self.backing_task_count,
         }
@@ -806,10 +817,23 @@ impl SessionActor {
                     .collect()
             })
             .unwrap_or_default();
-        let outstanding_live = self
-            .outstanding_reply_for_prompt(prompt_id)
+        let bindings = bridge
+            .read_resource::<State<
+                xai_grok_tools::implementations::grok_build::todo::SubagentTodoBindings,
+            >>()
             .await
-            .map(|r| r.live_ids.len())
+            .unwrap_or_default();
+        let bound_todo_ids = bindings.0.todo_ids().cloned().collect();
+        let outstanding = self.outstanding_reply_for_prompt(prompt_id).await;
+        let unbound_live = outstanding
+            .as_ref()
+            .map(|reply| {
+                reply
+                    .live_ids
+                    .iter()
+                    .filter(|id| !bindings.0.owns_subagent(id))
+                    .count()
+            })
             .unwrap_or(0);
         let incomplete_terminal_tasks = bridge
             .list_background_tasks()
@@ -817,10 +841,13 @@ impl SessionActor {
             .into_iter()
             .filter(xai_grok_tools::computer::types::TaskSnapshot::is_outstanding)
             .count();
-        let backing_task_count = outstanding_live + incomplete_terminal_tasks;
+        let unbound_backing_task_count = unbound_live + incomplete_terminal_tasks;
+        let backing_task_count = bindings.0.todo_ids().count() + unbound_backing_task_count;
         CollectedTodoGateInput {
             todos,
             backing_task_count,
+            bound_todo_ids,
+            unbound_backing_task_count,
         }
     }
 }

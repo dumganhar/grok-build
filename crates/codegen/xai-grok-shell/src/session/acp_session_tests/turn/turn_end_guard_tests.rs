@@ -200,7 +200,25 @@ fn collected(
             .map(|(id, content, status)| ((*id).to_string(), (*content).to_string(), *status))
             .collect(),
         backing_task_count,
+        bound_todo_ids: Default::default(),
+        unbound_backing_task_count: backing_task_count,
     }
+}
+
+#[test]
+fn as_input_prefers_explicit_todo_binding_over_insertion_order() {
+    let mut c = collected(
+        &[
+            ("first", "first task", TodoStatus::InProgress),
+            ("bound", "bound task", TodoStatus::InProgress),
+        ],
+        1,
+    );
+    c.bound_todo_ids.insert("bound".to_string());
+    c.unbound_backing_task_count = 0;
+    let input = c.as_input();
+    assert_eq!(input.in_progress_backed, vec!["bound task"]);
+    assert_eq!(input.in_progress_unbacked, vec!["first task"]);
 }
 
 #[test]

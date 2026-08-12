@@ -1099,6 +1099,8 @@ impl ToolRegistryBuilder {
         }
         resources.register_state::<crate::reminders::task_completion::ReportedTaskCompletions>();
         resources.register_state::<crate::implementations::grok_build::todo::TodoState>();
+        resources
+            .register_state::<crate::implementations::grok_build::todo::SubagentTodoBindings>();
         resources.register_state::<crate::types::resources::WebCitationCounter>();
         resources
             .register_state::<
@@ -1905,12 +1907,32 @@ impl FinalizedToolset {
     /// snapshots), this method captures a **fresh** snapshot of the current
     /// `Resources` and ensures it hits disk before returning.
     pub async fn save_and_flush_persistence(&self) -> &std::path::Path {
-        {
-            let res = self.resources.lock().await;
-            self.resources_persistence.save(&res);
+        if let Err(error) = self.try_save_and_flush_persistence().await {
+            tracing::warn!(
+                ?error,
+                path = ?self.resources_persistence.state_path(),
+                "failed to durably persist resources state"
+            );
         }
-        self.resources_persistence.flush().await;
         self.resources_persistence.state_path()
+    }
+
+    /// Durable variant used by state transitions that must not proceed until
+    /// the fresh snapshot is on disk.
+    pub async fn try_save_and_flush_persistence(&self) -> std::io::Result<&std::path::Path> {
+        let snapshot = self.resources.lock().await.serialize();
+        self.try_save_snapshot_and_flush_persistence(snapshot).await
+    }
+
+    /// Write a caller-captured resources snapshot and wait until it is durable.
+    /// Callers may use this while holding the resources lock to make an
+    /// in-memory state transition atomic with its persisted representation.
+    pub async fn try_save_snapshot_and_flush_persistence(
+        &self,
+        snapshot: serde_json::Value,
+    ) -> std::io::Result<&std::path::Path> {
+        self.resources_persistence.save_and_flush(snapshot).await?;
+        Ok(self.resources_persistence.state_path())
     }
 }
 /// Generate a JSON Schema for type `T`.

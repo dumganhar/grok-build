@@ -1704,6 +1704,10 @@ mod rewind_synthetic_turn_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/subagent_usage_fold_tests.rs"]
 mod subagent_usage_fold_tests;
+
+#[cfg(test)]
+#[path = "acp_session_tests/subagent_todo_binding_tests.rs"]
+mod subagent_todo_binding_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/turn_completion_emit_tests.rs"]
 mod turn_completion_emit_tests;

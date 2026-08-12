@@ -555,6 +555,13 @@ pub(crate) fn present_child_completion(
         parent_channel_open,
     ) && disposition.should_surface;
     if completion_data.spawned_notification_emitted || request.run_in_background {
+        if request.todo_id.is_some() {
+            notify_subagent_todo_finished(
+                &request.id,
+                result.success,
+                completion_data.parent_cmd_tx.as_ref(),
+            );
+        }
         emit_subagent_notification(
             gateway,
             &request.parent_session_id,
@@ -2098,6 +2105,18 @@ fn emit_subagent_notification(
         gateway.forward_fire_and_forget(ext_notification);
     }
 }
+fn notify_subagent_todo_finished(
+    subagent_id: &str,
+    completed: bool,
+    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+) {
+    if let Some(parent_cmd_tx) = parent_cmd_tx {
+        let _ = parent_cmd_tx.send(SessionCommand::SubagentTodoFinished {
+            subagent_id: subagent_id.to_owned(),
+            completed,
+        });
+    }
+}
 /// Progress notification emission interval.
 const PROGRESS_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Change signature for the progress-publisher dedupe:
@@ -2254,6 +2273,10 @@ mod progress_publisher_tests {
 pub(crate) struct SubagentMeta {
     pub subagent_id: String,
     pub parent_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_generation: Option<u64>,
     pub child_session_id: String,
     pub subagent_type: String,
     pub description: String,
@@ -2539,6 +2562,19 @@ fn update_subagent_meta_snapshot_ref(dir: &Path, snapshot_ref: &str, status: &st
     meta.status = status.to_string();
     write_subagent_meta(dir, &meta)
 }
+fn update_subagent_meta_todo_binding(dir: &Path, todo_id: &str, generation: u64) -> bool {
+    let meta_path = dir.join("meta.json");
+    let mut meta = match std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<SubagentMeta>(&data).ok())
+    {
+        Some(meta) => meta,
+        None => return false,
+    };
+    meta.todo_id = Some(todo_id.to_owned());
+    meta.todo_generation = Some(generation);
+    write_subagent_meta(dir, &meta)
+}
 #[must_use]
 fn persist_subagent_output(dir: &Path, result: &SubagentResult) -> Option<PathBuf> {
     (result.success && !result.output.is_empty() && write_subagent_output(dir, &result.output))
@@ -2598,6 +2634,22 @@ fn cancelled_orphan_finish(
         will_wake: false,
     }
 }
+fn restore_subagent_todo_binding(
+    subagent_id: &str,
+    todo_id: Option<&str>,
+    generation: Option<u64>,
+    parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
+) {
+    if let (Some(todo_id), Some(generation), Some(parent_cmd_tx)) =
+        (todo_id, generation, parent_cmd_tx)
+    {
+        let _ = parent_cmd_tx.send(SessionCommand::SubagentTodoRestore {
+            todo_id: todo_id.to_owned(),
+            subagent_id: subagent_id.to_owned(),
+            generation,
+        });
+    }
+}
 /// Flip a stale `running` meta to `cancelled` and emit the missing finish.
 /// On meta-write failure returns `false` and skips the notify, so a reload re-heals.
 fn finalize_orphaned_subagent(
@@ -2617,6 +2669,13 @@ fn finalize_orphaned_subagent(
     if !write_subagent_meta(subagent_meta_dir, &meta) {
         return false;
     }
+    restore_subagent_todo_binding(
+        &meta.subagent_id,
+        meta.todo_id.as_deref(),
+        meta.todo_generation,
+        parent_cmd_tx,
+    );
+    notify_subagent_todo_finished(&meta.subagent_id, false, parent_cmd_tx);
     emit_subagent_notification(
         gateway,
         &meta.parent_session_id,
@@ -2624,16 +2683,6 @@ fn finalize_orphaned_subagent(
         parent_cmd_tx,
     );
     true
-}
-/// Parse `meta_path` and return it only when it is a stale `running` orphan
-/// owned by `parent_session_id` and not tracked live. Malformed metas → `None`.
-fn running_orphan_meta(meta_path: &Path, parent_session_id: &str) -> Option<SubagentMeta> {
-    let data = std::fs::read_to_string(meta_path).ok()?;
-    let meta: SubagentMeta = serde_json::from_str(&data).ok()?;
-    if meta.status != "running" || meta.parent_session_id != parent_session_id {
-        return None;
-    }
-    Some(meta)
 }
 fn completed_finish_from_inspection(inspection: &SubagentInspection) -> Option<SessionUpdate> {
     let (status, error, tool_calls, turns) = match &inspection.snapshot.status {
@@ -2681,15 +2730,33 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
     for (id, child) in unfinished {
         candidates.insert(id.clone(), Some(child.clone()));
     }
+    let mut terminal_todo_finishes = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&subagents_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if running_orphan_meta(&entry.path().join("meta.json"), parent_session_id).is_some()
-                && let Some(id) = name.to_str()
-            {
-                candidates.entry(id.to_string()).or_insert(None);
+            let meta = std::fs::read_to_string(entry.path().join("meta.json"))
+                .ok()
+                .and_then(|data| serde_json::from_str::<SubagentMeta>(&data).ok());
+            let Some(meta) = meta.filter(|meta| meta.parent_session_id == parent_session_id) else {
+                continue;
+            };
+            restore_subagent_todo_binding(
+                &meta.subagent_id,
+                meta.todo_id.as_deref(),
+                meta.todo_generation,
+                parent_cmd_tx,
+            );
+            if meta.status == "running" {
+                if let Some(id) = name.to_str() {
+                    candidates.entry(id.to_string()).or_insert(None);
+                }
+            } else if !candidates.contains_key(&meta.subagent_id) {
+                terminal_todo_finishes.push((meta.subagent_id, meta.status == "completed"));
             }
         }
+    }
+    for (subagent_id, completed) in terminal_todo_finishes {
+        notify_subagent_todo_finished(&subagent_id, completed, parent_cmd_tx);
     }
     for (subagent_id, spawn_child) in candidates {
         let inspection = backend.inspect(&subagent_id).await;
@@ -2715,6 +2782,17 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
                         parent_session_id,
                         "Re-emitting finish for completed subagent with a lost terminal meta write"
                     );
+                    restore_subagent_todo_binding(
+                        &m.subagent_id,
+                        m.todo_id.as_deref(),
+                        m.todo_generation,
+                        parent_cmd_tx,
+                    );
+                    notify_subagent_todo_finished(
+                        &m.subagent_id,
+                        matches!(finish, SessionUpdate::SubagentFinished { ref status, .. } if status == "completed"),
+                        parent_cmd_tx,
+                    );
                     emit_subagent_notification(gateway, parent_session_id, finish, parent_cmd_tx);
                 } else {
                     tracing::info!(
@@ -2731,6 +2809,17 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
                     parent_session_id,
                     status = %m.status,
                     "Re-emitting finish for rewound subagent (terminal meta survived)"
+                );
+                restore_subagent_todo_binding(
+                    &m.subagent_id,
+                    m.todo_id.as_deref(),
+                    m.todo_generation,
+                    parent_cmd_tx,
+                );
+                notify_subagent_todo_finished(
+                    &m.subagent_id,
+                    m.status == "completed",
+                    parent_cmd_tx,
                 );
                 emit_subagent_notification(
                     gateway,
@@ -2759,6 +2848,7 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
                     parent_session_id,
                     "Reconciling inherited subagent with no local meta (cancelled)"
                 );
+                notify_subagent_todo_finished(&subagent_id, false, parent_cmd_tx);
                 emit_subagent_notification(
                     gateway,
                     parent_session_id,

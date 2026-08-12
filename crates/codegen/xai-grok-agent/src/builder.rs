@@ -1228,6 +1228,7 @@ const TASK_TOOL_NAMING: xai_tool_types::TaskToolNaming<'static> = xai_tool_types
     subagent_type_param: "${{ params.task.subagent_type }}",
     run_in_background_param: "${{ params.task.run_in_background }}",
     resume_from_param: "${{ params.task.resume_from }}",
+    todo_id_param: "${{ params.task.todo_id }}",
     background_retrieval_tool: "${{ tools.by_kind.background_task_action }}",
     isolation_param: "${{ params.task.isolation }}",
 };

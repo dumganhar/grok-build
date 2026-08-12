@@ -419,6 +419,23 @@ pub enum SessionCommand {
     XaiSessionNotification {
         notification: SessionNotification,
     },
+    /// A child has crossed the coordinator's pending-to-active boundary.
+    SubagentTodoStarted {
+        todo_id: String,
+        subagent_id: String,
+        respond_to: oneshot::Sender<Option<u64>>,
+    },
+    /// Restore durable Todo ownership before replaying a terminal child event.
+    SubagentTodoRestore {
+        todo_id: String,
+        subagent_id: String,
+        generation: u64,
+    },
+    /// A child reached a terminal state. Only the current Todo owner applies.
+    SubagentTodoFinished {
+        subagent_id: String,
+        completed: bool,
+    },
     /// Apply subagent usage into parent ledgers. Acks `()` once chat-state
     /// applied (prompt-attributed or session-only). Drop the oneshot on failure
     /// so the child treats the fold as not landed.

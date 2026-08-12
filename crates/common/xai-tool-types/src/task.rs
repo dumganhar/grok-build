@@ -103,6 +103,18 @@ pub struct TaskToolInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Existing Todo item this subagent is responsible for.
+    ///
+    /// When provided, the parent session keeps that Todo synchronized with the
+    /// subagent lifecycle: in progress after a confirmed start, completed only
+    /// after successful completion, and pending again after failure or
+    /// cancellation.
+    #[schemars(
+        description = "Exact ID of an existing Todo work item this subagent owns. Required when the subagent executes one existing non-heading Todo; omit only when it does not exclusively own a single Todo. The Todo is marked in_progress only after the child starts, completed only on success, and returned to pending on failure or cancellation. Never bind a phase-heading Todo ID."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_id: Option<String>,
+
     /// Server-injected before execution. Becomes the subagent's session ID.
     #[schemars(skip)]
     #[serde(default)]
@@ -1079,6 +1091,8 @@ pub struct TaskToolNaming<'a> {
     pub run_in_background_param: &'a str,
     /// Name of the `resume_from` parameter.
     pub resume_from_param: &'a str,
+    /// Name of the optional Todo binding parameter.
+    pub todo_id_param: &'a str,
     /// Name of the task result retrieval tool.
     pub background_retrieval_tool: &'a str,
     /// Name of the `isolation` parameter, used in the isolation/worktree
@@ -1108,6 +1122,7 @@ pub fn build_task_description(subagents: &[SubagentDescriptor], naming: &TaskToo
         subagent_type_param,
         run_in_background_param,
         resume_from_param,
+        todo_id_param,
         background_retrieval_tool,
         isolation_param,
     } = *naming;
@@ -1121,6 +1136,7 @@ pub fn build_task_description(subagents: &[SubagentDescriptor], naming: &TaskToo
          - {run_in_background_param}: Returns immediately with a subagent_id. Use {background_retrieval_tool} to retrieve results. This is set to true by default.\n\
          - Subagents receive a compacted version of project instructions (AGENTS.md). If the task requires detailed conventions (e.g., build rules, testing patterns), include the relevant rules directly in the prompt.\n\
          - When using the {task_tool} tool, you must specify a {subagent_type_param} parameter to select which agent type to use.\n\
+         - When a subagent executes one existing non-heading Todo, you MUST pass its exact ID in {todo_id_param}. Omit it only when the subagent does not exclusively own a single Todo. Never bind phase-heading Todos.\n\
          - When launching independent subagents, you MUST incorporate the results into the task based on requirements BEFORE concluding.\n\n\
          Resuming a previous agent (resume_from):\n\
          - Use {resume_from_param} to continue a previously completed subagent's conversation. Pass the subagent_id returned by a prior {task_tool} call. A resumed agent keeps its full transcript and tool state, so you only need to describe what changed since the last run — don't re-explain the original task.\n\
@@ -1360,6 +1376,7 @@ mod tests {
             subagent_type_param: "subagent_type",
             run_in_background_param: "run_in_background",
             resume_from_param: "resume_from",
+            todo_id_param: "todo_id",
             background_retrieval_tool: "get_task_output",
             isolation_param: "isolation",
         }
@@ -1398,6 +1415,18 @@ mod tests {
     }
 
     #[test]
+    fn task_tool_input_todo_id_is_optional_and_roundtrips() {
+        let omitted: TaskToolInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p"}"#).unwrap();
+        assert!(omitted.todo_id.is_none());
+
+        let explicit: TaskToolInput =
+            serde_json::from_str(r#"{"description":"d","prompt":"p","todo_id":"task-5"}"#).unwrap();
+        assert_eq!(explicit.todo_id.as_deref(), Some("task-5"));
+        assert_eq!(serde_json::to_value(explicit).unwrap()["todo_id"], "task-5");
+    }
+
+    #[test]
     fn task_tool_input_model_none_skips_serialize() {
         let input = TaskToolInput {
             prompt: "p".into(),
@@ -1409,6 +1438,7 @@ mod tests {
             resume_from: None,
             cwd: None,
             model: None,
+            todo_id: None,
             task_id: None,
         };
         let value = serde_json::to_value(&input).unwrap();
@@ -1514,6 +1544,7 @@ mod tests {
             "delegation timing belongs in the shared system prompt, not the task contract: {desc}"
         );
         assert!(desc.contains("Use resume_from to continue"));
+        assert!(desc.contains("MUST pass its exact ID in todo_id"));
     }
 
     #[test]
@@ -1692,6 +1723,7 @@ mod tests {
                 subagent_type_param: "${{ params.task.subagent_type }}",
                 run_in_background_param: "${{ params.task.run_in_background }}",
                 resume_from_param: "${{ params.task.resume_from }}",
+                todo_id_param: "${{ params.task.todo_id }}",
                 background_retrieval_tool: "${{ tools.by_kind.background_task_action }}",
                 isolation_param: "${{ params.task.isolation }}",
             },

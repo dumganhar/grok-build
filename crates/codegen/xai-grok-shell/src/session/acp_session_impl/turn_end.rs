@@ -22,24 +22,29 @@ impl SessionActor {
     /// No-op if no `in_progress` items exist.
     pub(super) async fn emit_turn_end_plan_cleanup(&self) {
         use crate::tools::todo::{TodoState, TodoStatus, plan_entry_from_todo_item};
+        use xai_grok_tools::implementations::grok_build::todo::SubagentTodoBindings;
         use xai_grok_tools::types::resources::State;
 
-        // Read the current TodoState (no mutation).
+        // Read the current TodoState and explicit Subagent owners (no mutation).
         let (entries, stale_count) = {
-            let res = self
-                .agent
-                .borrow()
-                .tool_bridge()
-                .read_resource::<State<TodoState>>()
-                .await;
-            let Some(state) = res else {
+            let bridge = self.tool_bridge_handle();
+            let resources = bridge.shared_resources().await;
+            let resources = resources.lock().await;
+            let Some(state) = resources.get::<State<TodoState>>() else {
                 return; // No todo state at all.
             };
+            let bindings = resources
+                .get::<State<SubagentTodoBindings>>()
+                .cloned()
+                .unwrap_or_default();
 
             let stale_count = state
                 .0
-                .todo_items()
-                .filter(|t| t.status == TodoStatus::InProgress)
+                .todo_items_with_ids()
+                .filter(|(id, item)| {
+                    item.status == TodoStatus::InProgress
+                        && !bindings.0.todo_ids().any(|bound_id| bound_id == *id)
+                })
                 .count();
             if stale_count == 0 {
                 return;
@@ -50,10 +55,12 @@ impl SessionActor {
             // preserve cancelled metadata, priority, and other semantics.
             let entries: Vec<_> = state
                 .0
-                .todo_items()
-                .map(|item| {
+                .todo_items_with_ids()
+                .map(|(id, item)| {
                     let mut entry = plan_entry_from_todo_item(item.clone());
-                    if item.status == TodoStatus::InProgress {
+                    if item.status == TodoStatus::InProgress
+                        && !bindings.0.todo_ids().any(|bound_id| bound_id == id)
+                    {
                         entry.status = acp::PlanEntryStatus::Completed;
                     }
                     entry

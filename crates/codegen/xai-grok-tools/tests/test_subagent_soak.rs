@@ -399,6 +399,7 @@ fn soak_request(id: String, background: bool) -> SubagentRequest {
         subagent_type: "explore".to_owned(),
         parent_session_id: PARENT_SESSION_ID.to_owned(),
         parent_prompt_id: Some("soak-prompt".to_owned()),
+        todo_id: None,
         resume_from: None,
         cwd: None,
         runtime_overrides: Default::default(),
