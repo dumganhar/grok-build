@@ -101,6 +101,16 @@ fn repaired_native_arguments(native: &str, tagged: &str) -> Option<String> {
     repair_argument_value(&mut native, &tagged).then(|| native.to_string())
 }
 
+fn tool_arguments_equal(native: &str, tagged: &str) -> bool {
+    match (
+        serde_json::from_str::<serde_json::Value>(native),
+        serde_json::from_str::<serde_json::Value>(tagged),
+    ) {
+        (Ok(native), Ok(tagged)) => native == tagged,
+        _ => native == tagged,
+    }
+}
+
 fn argument_value_is_placeholder(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => true,
@@ -167,26 +177,42 @@ fn streaming_safe_prefix_len(text: &str) -> (usize, bool) {
     (text.len() - held_suffix_len, false)
 }
 
-/// Some OpenAI-compatible model servers duplicate native tool calls as tagged
-/// assistant text. The native call owns execution; recover its arguments from
-/// the tagged twin only when malformed, and hide every matched text duplicate.
-fn recover_tagged_tool_calls(content: &str, tool_calls: &mut [ToolCall]) -> String {
+/// Reconcile model servers that mix native tool calls with tagged assistant
+/// text. Exact twins are hidden, malformed native arguments may be repaired,
+/// and remaining tagged calls are promoted so they execute instead of leaking
+/// into visible assistant text. Tagged-only prose remains untouched.
+fn reconcile_tagged_tool_calls(
+    content: &str,
+    tool_calls: &mut Vec<ToolCall>,
+    request_id: &RequestId,
+) -> String {
     if !content.contains(TAGGED_TOOL_CALL_OPEN) {
         return content.to_owned();
     }
 
     let tagged_calls = parse_tagged_tool_calls(content);
+    if tool_calls.is_empty() || tagged_calls.is_empty() {
+        return content.to_owned();
+    }
     let mut used = vec![false; tagged_calls.len()];
-    for call in tool_calls {
-        let Some((index, tagged)) = tagged_calls
-            .iter()
-            .enumerate()
-            .find(|(index, tagged)| !used[*index] && tagged.name == call.name)
-        else {
+    for call in tool_calls.iter_mut() {
+        if let Some((index, _)) = tagged_calls.iter().enumerate().find(|(index, tagged)| {
+            !used[*index]
+                && tagged.name == call.name
+                && tool_arguments_equal(&call.arguments, &tagged.arguments)
+        }) {
+            used[index] = true;
             continue;
-        };
-        used[index] = true;
-        if let Some(arguments) = repaired_native_arguments(&call.arguments, &tagged.arguments) {
+        }
+
+        let repaired = tagged_calls.iter().enumerate().find_map(|(index, tagged)| {
+            (!used[index] && tagged.name == call.name)
+                .then(|| repaired_native_arguments(&call.arguments, &tagged.arguments))
+                .flatten()
+                .map(|arguments| (index, arguments))
+        });
+        if let Some((index, arguments)) = repaired {
+            used[index] = true;
             call.arguments = std::sync::Arc::<str>::from(arguments);
             tracing::warn!(
                 tool_call_id = %call.id,
@@ -194,6 +220,31 @@ fn recover_tagged_tool_calls(content: &str, tool_calls: &mut [ToolCall]) -> Stri
                 "recovered malformed or incomplete Chat Completions tool arguments from tagged assistant text"
             );
         }
+    }
+
+    let mut promoted = 0usize;
+    for (index, tagged) in tagged_calls.iter().enumerate() {
+        if used[index] {
+            continue;
+        }
+        used[index] = true;
+        promoted += 1;
+        tool_calls.push(ToolCall {
+            id: std::sync::Arc::<str>::from(format!(
+                "call_tagged_{}_{}",
+                request_id.as_str(),
+                index
+            )),
+            name: tagged.name.clone(),
+            arguments: std::sync::Arc::<str>::from(tagged.arguments.clone()),
+        });
+    }
+    if promoted > 0 {
+        tracing::warn!(
+            request_id = %request_id,
+            promoted_tool_call_count = promoted,
+            "promoted Chat Completions tagged assistant text to structured tool calls"
+        );
     }
 
     if !used.iter().any(|value| *value) {
@@ -489,7 +540,8 @@ pub fn stream_chat_completions<'a>(
                 arguments: std::sync::Arc::<str>::from(arguments),
             })
             .collect();
-        let visible_content = recover_tagged_tool_calls(&content_acc, &mut tool_calls);
+        let visible_content =
+            reconcile_tagged_tool_calls(&content_acc, &mut tool_calls, &request_id);
         let streamed_prefix = &content_acc[..streamed_content_len];
         let deferred_visible_text = match visible_content.strip_prefix(streamed_prefix) {
             Some(text) => text.to_owned(),
@@ -1082,7 +1134,7 @@ mod tests {
             ),
         }];
 
-        let visible = recover_tagged_tool_calls(tagged, &mut tool_calls);
+        let visible = reconcile_tagged_tool_calls(tagged, &mut tool_calls, &rid());
 
         assert_eq!(visible, "");
         assert_eq!(
@@ -1092,12 +1144,12 @@ mod tests {
     }
 
     #[test]
-    fn valid_tool_arguments_remain_authoritative_while_duplicate_text_is_hidden() {
+    fn semantically_duplicate_tagged_text_is_hidden_without_replacing_native_arguments() {
         let tagged = concat!(
             "<tool_call>\n",
             "<function=get_command_or_subagent_output>\n",
-            "<parameter=task_ids>[\"tagged-task\"]</parameter>\n",
-            "<parameter=timeout_ms>60000</parameter>\n",
+            "<parameter=task_ids>[\"native-task\"]</parameter>\n",
+            "<parameter=timeout_ms>120000</parameter>\n",
             "</function>\n",
             "</tool_call>"
         );
@@ -1108,10 +1160,144 @@ mod tests {
             arguments: std::sync::Arc::<str>::from(native_arguments),
         }];
 
-        let visible = recover_tagged_tool_calls(tagged, &mut tool_calls);
+        let visible = reconcile_tagged_tool_calls(tagged, &mut tool_calls, &rid());
 
         assert_eq!(visible, "");
+        assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].arguments.as_ref(), native_arguments);
+    }
+
+    #[tokio::test]
+    async fn hybrid_tagged_calls_are_promoted_without_leaking_live_payload() {
+        let prefix =
+            "Now let me check the .env.example file, skillhub-server tests, and remaining pieces.";
+        let tagged_paths = [
+            "/workspace/project/src/oauth-broker",
+            "/workspace/project/src/heartbeat-server",
+            "/workspace/project/src/voice-server",
+            "/workspace/project/src/github-server",
+            "/workspace/project/src/slack-hook-server",
+            "/workspace/project/src/telegram-hook-server",
+            "/workspace/project/src/x-hook-server",
+        ];
+        let tagged: String = tagged_paths
+            .iter()
+            .map(|path| {
+                format!(
+                    "<tool_call>\n<function=grep>\n<parameter=pattern>__tests__</parameter>\n<parameter=path>{path}</parameter>\n</function>\n</tool_call>"
+                )
+            })
+            .collect();
+        let content = format!("{prefix}{tagged}");
+        let tool_chunk = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            reasoning: None,
+            tool_calls: vec![
+                ChunkToolCallDelta {
+                    index: 0,
+                    id: Some("call_glob".into()),
+                    kind: Some("function".into()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some("glob".into()),
+                        arguments: Some(
+                            serde_json::json!({
+                                "pattern": "**/.env.example",
+                                "path": "/workspace/project"
+                            })
+                            .to_string(),
+                        ),
+                    }),
+                },
+                ChunkToolCallDelta {
+                    index: 1,
+                    id: Some("call_list".into()),
+                    kind: Some("function".into()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some("list_dir".into()),
+                        arguments: Some(
+                            serde_json::json!({
+                                "target_directory": "/workspace/project/src/skillhub-server"
+                            })
+                            .to_string(),
+                        ),
+                    }),
+                },
+                ChunkToolCallDelta {
+                    index: 2,
+                    id: Some("call_grep".into()),
+                    kind: Some("function".into()),
+                    function: Some(ToolCallFunctionDelta {
+                        name: Some("grep".into()),
+                        arguments: Some(
+                            serde_json::json!({
+                                "pattern": "__tests__",
+                                "path": "/workspace/project/src/skillhub-server"
+                            })
+                            .to_string(),
+                        ),
+                    }),
+                },
+            ],
+            tool_call_id: None,
+        }]);
+        let events = collect(stream_chat_completions(
+            stream::iter(vec![Ok(text_chunk(&content)), Ok(tool_chunk)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Text,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed_text, prefix);
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let assistant = response.assistant().expect("assistant item present");
+                assert_eq!(assistant.content.as_ref(), prefix);
+                assert_eq!(assistant.tool_calls.len(), 10);
+                assert_eq!(
+                    assistant.tool_calls[..3]
+                        .iter()
+                        .map(|call| call.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["glob", "list_dir", "grep"]
+                );
+                let promoted_paths = assistant.tool_calls[3..]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, call)| {
+                        assert_eq!(call.name, "grep");
+                        assert_eq!(call.id.as_ref(), format!("call_tagged_test-req_{index}"));
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(&call.arguments).unwrap();
+                        assert_eq!(arguments["pattern"], "__tests__");
+                        arguments["path"].as_str().unwrap().to_owned()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    promoted_paths,
+                    tagged_paths
+                        .map(str::to_owned)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(response.message_chunks_emitted, 1);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
