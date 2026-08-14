@@ -2513,6 +2513,7 @@ mod tests {
         };
         let w = WebSearchOptions {
             allowed_domains: Some(vec!["x.com".into()]),
+            excluded_domains: None,
         };
 
         // set: an object sets that tool's options.

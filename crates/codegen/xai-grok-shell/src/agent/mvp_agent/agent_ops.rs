@@ -647,6 +647,10 @@ impl MvpAgent {
                 std::sync::atomic::Ordering::Relaxed,
             );
     }
+    /// Call after every `remote_settings` rewrite: the gate's readers hold no `Config`.
+    pub(super) fn apply_session_search_gate(&self) {
+        crate::config::apply_session_search_gate(&self.cfg.borrow());
+    }
     /// Current client type as set by the most recent `initialize()` call.
     pub(crate) fn client_type(&self) -> ClientType {
         *self.client_type.borrow()
@@ -1459,6 +1463,7 @@ impl MvpAgent {
             }
         }
         self.sync_collection_config_gate();
+        self.apply_session_search_gate();
         self.emit_settings_update_notification();
         self.emit_announcements(AnnouncementsPushMode::IfChanged);
         self.reconfigure_heap_profile_monitor();
@@ -1706,6 +1711,7 @@ impl MvpAgent {
             cfg.re_resolve_runtime_fields(&raw_config);
         }
         self.sync_collection_config_gate();
+        self.apply_session_search_gate();
         self.emit_settings_update_notification();
         self.emit_announcements(AnnouncementsPushMode::Force);
         self.reconfigure_heap_profile_monitor();
