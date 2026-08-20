@@ -9,7 +9,7 @@
 //! ```ignore
 //! let mut status = AgentStatusBar::new(&theme);
 //! status.push("context", context_line);
-//! status.push("badge", badge_line);
+//! status.push("queue", queue_line);
 //! let areas = status.render(buf, status_bar_rect);
 //! let context_area = areas.get("context");
 //! ```
@@ -26,10 +26,11 @@ use super::turn_status::SPINNER_DIVISOR;
 use crate::app::agent::{GoalDisplayPhase, GoalDisplayState, GoalDisplayStatus};
 use crate::app::agent_view::McpInitProgress;
 use crate::theme::Theme;
+use crate::views::tasks_pane::TaskStatusCounts;
 
 /// A named status bar item.
 struct StatusEntry {
-    /// Identifier for hit-test lookup (e.g., "context", "badge").
+    /// Identifier for hit-test lookup (e.g., "context", "queue").
     id: &'static str,
     /// Pre-built styled content.
     line: Line<'static>,
@@ -132,6 +133,50 @@ impl<'a> AgentStatusBar<'a> {
 
         areas
     }
+}
+
+pub(crate) fn task_status_line(
+    counts: TaskStatusCounts,
+    theme: &Theme,
+    is_hovered: bool,
+    tick: u64,
+) -> Option<Line<'static>> {
+    if counts == TaskStatusCounts::default() {
+        return None;
+    }
+
+    let hover = if is_hovered {
+        ratatui::style::Modifier::BOLD
+    } else {
+        ratatui::style::Modifier::empty()
+    };
+    let running_style = Style::default()
+        .fg(theme.accent_running)
+        .bg(theme.bg_base)
+        .add_modifier(hover);
+    let paused_style = Style::default()
+        .fg(theme.warning)
+        .bg(theme.bg_base)
+        .add_modifier(hover);
+    let mut spans = Vec::with_capacity(2);
+
+    if counts.running > 0 {
+        let frames = crate::glyphs::dot_spinner_frames();
+        let frame_idx = (tick / SPINNER_DIVISOR) as usize % frames.len();
+        spans.push(Span::styled(
+            format!("{} {}", frames[frame_idx], counts.running),
+            running_style,
+        ));
+    }
+    if counts.paused_workflows > 0 {
+        let prefix = if counts.running > 0 { "  " } else { "" };
+        spans.push(Span::styled(
+            format!("{prefix}P {}", counts.paused_workflows),
+            paused_style,
+        ));
+    }
+
+    Some(Line::from(spans))
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +369,10 @@ pub fn mcp_status_line(
         ),
     ]))
 }
+
+#[cfg(test)]
+#[path = "agent_status_task_tests.rs"]
+mod task_tests;
 
 #[cfg(test)]
 mod tests {

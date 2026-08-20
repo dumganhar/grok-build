@@ -29,6 +29,18 @@ use super::session_load_barrier::{
 };
 use super::{PagerArgs, PagerTerminal, acp_handler, dispatch, effects};
 
+/// During a continuous terminal drag, dozens of resize events fire per second,
+/// and each would rebuild the layout of every entry. One deferred draw runs
+/// after the size stabilizes instead.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
+
+/// A resize queues a forced status-line re-run, and the script is told the
+/// width the debounced draw recorded.
+const _: () = assert!(
+    RESIZE_DEBOUNCE.as_millis() < crate::app::app_view::SLOW_TICK_INTERVAL.as_millis(),
+    "the debounced draw must record the new width before the forced re-run reads it"
+);
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TimedInputEvent {
     pub(super) event: Event,
@@ -339,6 +351,29 @@ fn seed_trust_state(
         TrustOutcome::Prompt => TrustState::Pending { workspace: key },
         TrustOutcome::Trusted | TrustOutcome::Untrusted => TrustState::Done,
     };
+}
+
+/// Must run before the first render, or the startup-intent block opens a session behind the gate
+/// and the first frame shows the normal welcome.
+pub(crate) fn seed_consent_state_from_gate(
+    app: &mut AppView,
+    gate: Option<&xai_grok_shell::util::config::ConsentGate>,
+) {
+    use crate::app::consent::{ConsentInputs, consent_verdict};
+    let stored = xai_grok_shell::config::load_from_disk()
+        .ok()
+        .map(|root| xai_grok_shell::util::config::load_config_from_toml(&root).consent)
+        .unwrap_or_default();
+    app.consent_state = consent_verdict(&ConsentInputs {
+        gate,
+        answered_this_run: app
+            .consent_answered
+            .as_ref()
+            .map(|(id, version)| (id.as_str(), *version)),
+        answers: &stored.answers,
+        account: app.account_email.as_deref(),
+        minimal: app.screen_mode.is_minimal(),
+    });
 }
 
 /// Pause terminal input and wait up to `timeout` for the reader to acknowledge.
@@ -1035,6 +1070,13 @@ pub(crate) async fn run(
     app.plugin_cta_enabled = xai_grok_config::env_bool("GROK_PLUGIN_CTA")
         .or_else(|| remote_settings.as_ref().and_then(|s| s.plugin_cta))
         .unwrap_or(false);
+    app.workspace_dashboard_enabled = xai_grok_config::env_bool("GROK_WORKSPACE_DASHBOARD")
+        .or_else(|| {
+            remote_settings
+                .as_ref()
+                .and_then(|s| s.workspace_dashboard_enabled)
+        })
+        .unwrap_or(false);
     // Voice is applied after auth_meta so API-key detection is accurate.
     app.session_picker_grouped = std::env::var("GROK_SESSION_PICKER_GROUPED")
         .ok()
@@ -1448,6 +1490,11 @@ pub(crate) async fn run(
     // Seed app state from disk once at the I/O boundary so dispatch
     // stays sans-IO.
     app.current_ui = load_initial_ui_config();
+    // Here rather than from the row's own update: that runs only once an agent
+    // view is on screen, so a minimal-mode or welcome-only session would be
+    // missing from the denominator adoption is measured against.
+    crate::app::status_line::metrics::global()
+        .report_config(&app.current_ui.status_line, app.screen_mode);
     // Field-tolerant: a whole-`UiConfig` default (malformed unrelated `[ui]`
     // field) must not wipe a valid `show_timeline` or leave appearance /
     // cache / `current_ui` disagreeing — `/timeline` and the rail all read
@@ -1594,6 +1641,13 @@ pub(crate) async fn run(
     // Feature-off (kill-switch / opt-out / local build) resolves `Trusted`, so
     // this stays `TrustState::Done`.
     seed_trust_state(&mut app, remote_settings.as_ref());
+    seed_consent_state_from_gate(
+        &mut app,
+        remote_settings
+            .as_ref()
+            .and_then(|s| s.consent_gate.as_ref()),
+    );
+
     // Type-ahead captured while the app was still loading (see `init_terminal`),
     // replayed only when the composer is already the active input consumer; a
     // startup screen still being up means the keys are dropped, not replayed.
@@ -1718,6 +1772,19 @@ pub(crate) async fn run(
 
     const BILLING_POLL_INTERVAL: Duration = Duration::from_secs(30);
     let mut billing_poll_at: Option<Instant> = None;
+
+    // `[ui.status_line] refresh_interval`: re-runs a command row on a timer.
+    // Read once, like the section it comes from, so a future config reload
+    // must run this arming again; unarmed where this process can never draw
+    // the row.
+    let status_line_refresh_interval: Option<Duration> =
+        if super::status_line::draws_a_row(app.screen_mode, &app.current_ui.status_line) {
+            app.status_line_refresh_interval()
+        } else {
+            None
+        };
+    let mut status_line_poll_at: Option<Instant> =
+        status_line_refresh_interval.map(|interval| Instant::now() + interval);
 
     const GATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
     let mut gate_poll_at: Option<Instant> = None;
@@ -1979,11 +2046,6 @@ pub(crate) async fn run(
     // (without waiting for user input).
     schedule_tick(&mut animation_tick_at, &app, tick_interval);
 
-    // Resize debounce: during continuous terminal drags, dozens of resize
-    // events fire per second. Each would trigger a full layout rebuild of all
-    // entries (the most expensive per-frame operation). Instead of drawing on
-    // every resize, we schedule a single deferred draw after the size stabilizes.
-    const RESIZE_DEBOUNCE: Duration = Duration::from_millis(16);
     let mut resize_debounce_at: Option<Instant> = None;
 
     // Cadences resolved once above (env > auto > 16ms). AppView/Default stays hermetic.
@@ -2239,6 +2301,13 @@ pub(crate) async fn run(
             }
         };
 
+        let status_line_poll = async {
+            match status_line_poll_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+
         let gate_poll = async {
             match gate_poll_at {
                 Some(at) => sleep_until(at).await,
@@ -2359,6 +2428,13 @@ pub(crate) async fn run(
                             return Ok(finish_run(&mut app));
                         }
                     }
+                }
+
+                // A snapshot inside the refresh floor changes nothing yet but
+                // still owes a run, and the arm below arms the tick only on a
+                // state change.
+                if app.status_line.force_pending() {
+                    schedule_tick(&mut animation_tick_at, &app, tick_interval);
                 }
 
                 if state_changed {
@@ -2593,6 +2669,25 @@ pub(crate) async fn run(
                 }
                 if !app.has_access() {
                     gate_poll_at = Some(Instant::now() + GATE_POLL_INTERVAL);
+                }
+            }
+
+            _ = status_line_poll => {
+                status_line_poll_at = None;
+                // Raises the pending poll and runs the update; the run's effect
+                // lands in `pending_effects`, drained below like every arm's.
+                app.note_status_line_poll_due();
+                // A poll that could not run yet is carried to the run it is
+                // owed; `status_line_tick_demand` owns the routing.
+                schedule_tick(&mut animation_tick_at, &app, tick_interval);
+                if app.status_line.take_changed() {
+                    presenter.request(false);
+                }
+                // Re-armed at fire time, so the cadence is independent of how
+                // long a run takes; the owed-run rule above is what keeps a
+                // slow script from stacking runs behind the timer.
+                if let Some(interval) = status_line_refresh_interval {
+                    status_line_poll_at = Some(Instant::now() + interval);
                 }
             }
 
@@ -3071,6 +3166,15 @@ pub(crate) async fn run(
             }
         }
 
+        // Whatever the arm above queued, run it before painting. An arm may
+        // still drain inline when it needs the effects applied sooner.
+        if !app.pending_effects.is_empty() {
+            let effs = std::mem::take(&mut app.pending_effects);
+            if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+                break;
+            }
+        }
+
         presenter.present_if_dirty(&mut app, terminal);
     }
 
@@ -3079,17 +3183,25 @@ pub(crate) async fn run(
     Ok(finish_run(&mut app))
 }
 
-/// Load `UiConfig` from the shell's layered config at startup.
-/// Falls back to `UiConfig::default()` on any failure.
+/// `[ui]` as it was on disk at startup, or the default if it could not be read.
+/// Read once for the process: the status line capability is advertised from this
+/// at connect and the row is rendered from it later, and a second read could
+/// answer the two differently.
 pub(crate) fn load_initial_ui_config() -> xai_grok_shell::agent::config::UiConfig {
     use xai_grok_shell::agent::config::UiConfig;
-    let Ok(root) = xai_grok_shell::config::load_effective_config() else {
-        return UiConfig::default();
-    };
-    let Some(ui_value) = root.get("ui").cloned() else {
-        return UiConfig::default();
-    };
-    ui_value.try_into::<UiConfig>().unwrap_or_default()
+    static INITIAL_UI: std::sync::OnceLock<UiConfig> = std::sync::OnceLock::new();
+
+    INITIAL_UI
+        .get_or_init(|| {
+            let Ok(root) = xai_grok_shell::config::load_effective_config() else {
+                return UiConfig::default();
+            };
+            let Some(ui_value) = root.get("ui").cloned() else {
+                return UiConfig::default();
+            };
+            ui_value.try_into::<UiConfig>().unwrap_or_default()
+        })
+        .clone()
 }
 
 /// Config `Option<bool>` mirrors seeded once at startup. `None` = no
@@ -3521,29 +3633,22 @@ async fn drain_and_process(
                 had_non_resize_change = true;
             }
             InputOutcome::ActionThenForward(action) => {
-                // Dispatch the action (e.g. create session), then re-process
-                // the same event through the now-active view so the input
-                // (character, paste) lands in the session's prompt.
-                let effs = dispatch::dispatch(action, app);
-                if process_effects(effs, tasks, app, progress_tx) {
-                    return true;
-                }
-                if let InputOutcome::Action(follow_up) = app.handle_input_at_with_paste_provenance(
+                // One combined effect wave so forwarded state (e.g. CycleMode) shapes session/new meta.
+                let effs = dispatch_then_forward(
+                    action,
                     ev,
                     routed.arrived_at,
                     routed.paste_provenance,
-                ) {
-                    let effs = dispatch::dispatch(follow_up, app);
-                    if process_effects(effs, tasks, app, progress_tx) {
-                        return true;
-                    }
+                    app,
+                );
+                if process_effects(effs, tasks, app, progress_tx) {
+                    return true;
                 }
                 needs_draw = true;
                 had_non_resize_change = true;
             }
             InputOutcome::ActionPair(first, second) => {
-                // Dispatch both in order; first must fully resolve
-                // before second (e.g. revert preview then open reset).
+                // Effect barrier: first must fully resolve before second (e.g. revert preview then open reset).
                 let effs = dispatch::dispatch(first, app);
                 if process_effects(effs, tasks, app, progress_tx) {
                     return true;
@@ -3559,6 +3664,7 @@ async fn drain_and_process(
                 needs_draw = true;
                 if is_resize {
                     had_resize = true;
+                    app.queue_status_line_resize();
                 } else {
                     had_non_resize_change = true;
                 }
@@ -4042,6 +4148,12 @@ pub(crate) fn retarget_suppress_code_restore(app: &mut AppView, from: &str, to: 
 }
 
 /// Shared [`SessionFlags`] builder (interactive loop + leader-cluster).
+///
+/// Permission seeds come from the global mirrors (`default_yolo`,
+/// `current_ui.permission_mode`). Pre-session `CycleMode` / `SetPermissionMode`
+/// update those synchronously, and `ActionThenForward` batches mode dispatch
+/// before this runs, so create meta sees the post-mode values without
+/// effect-shape sniffing.
 pub(crate) fn session_flags_for_effects(
     app: &mut AppView,
     #[cfg_attr(not(feature = "local-workspace"), allow(unused_variables))]
@@ -4093,6 +4205,24 @@ pub(crate) fn session_flags_for_effects(
         is_api_key_auth: app.is_api_key_auth,
         resume_local_miss: app.resume_local_miss.clone(),
     }
+}
+
+/// Dispatch `action`, re-process `event` through the updated view, return one combined effect list.
+/// Shared by the event-loop `ActionThenForward` arm and tests (batches; no effect barrier between).
+fn dispatch_then_forward(
+    action: Action,
+    event: &Event,
+    arrived_at: std::time::Instant,
+    paste_provenance: PasteProvenance,
+    app: &mut AppView,
+) -> Vec<Effect> {
+    let mut effects = dispatch::dispatch(action, app);
+    if let InputOutcome::Action(follow_up) =
+        app.handle_input_at_with_paste_provenance(event, arrived_at, paste_provenance)
+    {
+        effects.extend(dispatch::dispatch(follow_up, app));
+    }
+    effects
 }
 
 /// Spawn effects into the task set. Returns `true` if the app should quit.
@@ -4339,6 +4469,144 @@ mod tests {
         assert!(
             flags.local_workspace.is_none(),
             "conversation load must strip local stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_create_uses_auto_selected_before_effect_execution() {
+        let mut app = crate::app::app_view::tests::test_app();
+        app.default_yolo = true;
+        app.current_ui.permission_mode = Some("always-approve".into());
+        let (acp_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.acp_tx = acp_tx;
+        let create_effects = dispatch::dispatch(Action::NewSession, &mut app);
+        let mode_effects = dispatch::dispatch(
+            Action::SetPermissionMode(crate::app::actions::PermissionModeKind::Auto),
+            &mut app,
+        );
+        assert!(mode_effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistPermissionMode {
+                canonical: "auto",
+                session_id: None,
+                ..
+            }
+        )));
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = JoinSet::new();
+
+        assert!(!process_effects(
+            create_effects,
+            &mut tasks,
+            &mut app,
+            &progress_tx
+        ));
+
+        let request = match acp_rx.recv().await.expect("session/new request") {
+            xai_acp_lib::AcpAgentMessage::NewSession(args) => args.request,
+            other => panic!("expected session/new, got {other:?}"),
+        };
+        let meta = request.meta.expect("permission metadata");
+        assert_eq!(meta.get("yoloMode"), Some(&serde_json::json!(false)));
+        assert_eq!(meta.get("autoMode"), Some(&serde_json::json!(true)));
+        assert_eq!(app.current_ui.permission_mode.as_deref(), Some("auto"));
+        assert!(!app.default_yolo);
+    }
+
+    #[test]
+    fn welcome_shift_tab_applies_mode_before_session_new_is_sent() {
+        for (
+            initial_mode,
+            initial_yolo,
+            expected_mode,
+            expected_yolo,
+            expected_auto,
+            expected_canonical,
+        ) in [
+            ("always-approve", true, "ask", false, false, "ask"),
+            (
+                "auto",
+                false,
+                "always-approve",
+                true,
+                false,
+                "always-approve",
+            ),
+        ] {
+            let mut app = crate::app::app_view::tests::test_app();
+            app.default_yolo = initial_yolo;
+            app.current_ui.permission_mode = Some(initial_mode.into());
+            let event = Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+            let effects = dispatch_then_forward(
+                Action::NewSession,
+                &event,
+                std::time::Instant::now(),
+                PasteProvenance::Terminal,
+                &mut app,
+            );
+
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::PersistPermissionMode {
+                    canonical,
+                    session_id: None,
+                    ..
+                } if *canonical == expected_canonical
+            )));
+            let create = effects
+                .into_iter()
+                .find(|effect| matches!(effect, Effect::CreateSession { .. }))
+                .expect("create effect");
+            let flags = session_flags_for_effects(&mut app, std::slice::from_ref(&create));
+            let meta = flags.to_meta().expect("permission metadata");
+
+            assert_eq!(
+                meta.get("yoloMode"),
+                Some(&serde_json::json!(expected_yolo))
+            );
+            assert_eq!(
+                meta.get("autoMode"),
+                Some(&serde_json::json!(expected_auto))
+            );
+            assert_eq!(
+                app.current_ui.permission_mode.as_deref(),
+                Some(expected_mode)
+            );
+            assert_eq!(app.default_yolo, expected_yolo);
+        }
+    }
+
+    #[tokio::test]
+    async fn welcome_paste_preserves_create_and_forwarded_prompt() {
+        let mut app = crate::app::app_view::tests::test_app();
+        let (acp_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.acp_tx = acp_tx;
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(input_tx);
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = JoinSet::new();
+        let mut csi_filter = super::super::csi_filter::CsiFragmentFilter::new();
+        let mut xt_filter = super::super::xt_filter::XtversionFilter::new();
+
+        let result = drain_and_process(
+            TimedInputEvent::now(Event::Paste("fix the bug".into())),
+            &mut input_rx,
+            &mut app,
+            &mut tasks,
+            &progress_tx,
+            &mut csi_filter,
+            &mut xt_filter,
+        )
+        .await;
+
+        assert!(!result.should_quit);
+        assert!(matches!(
+            acp_rx.recv().await.expect("session/new request"),
+            xai_acp_lib::AcpAgentMessage::NewSession(_)
+        ));
+        assert_eq!(
+            app.agents[&crate::app::agent::AgentId(0)].prompt.text(),
+            "fix the bug"
         );
     }
 

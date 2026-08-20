@@ -119,8 +119,10 @@ pub struct AcpConnection {
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFlags {
     pub subagents: bool,
-    pub experimental_memory: bool,
-    pub no_memory: bool,
+    /// CLI memory override set by a legacy compatibility flag.
+    pub memory_enabled_override: Option<bool>,
+    /// Original compatibility flag spelling for leader-mode warnings.
+    pub memory_override_flag: Option<&'static str>,
     pub disable_web_search: bool,
     /// Session-scoped `--todo-gate` override. Forces
     /// `ReminderPolicy.todo_gate.enabled = true` for this session.
@@ -133,6 +135,9 @@ pub struct ConnectFlags {
     pub laziness_debug_log: Option<std::path::PathBuf>,
     /// Storage mode override.
     pub storage_mode: Option<String>,
+    /// Whether this client will draw a status row, advertised as
+    /// `x.ai/statusLine` so the agent can skip an unpainted payload.
+    pub status_line: bool,
     /// Client identifier for ACP Initialize metadata.
     pub client_identifier: Option<String>,
     /// Hunk tracker mode for ACP Initialize capabilities.
@@ -178,8 +183,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         cli_subagents: Some(flags.subagents),
         cli_web_search_model: None,
         cli_session_summary_model: None,
-        cli_experimental_memory: flags.experimental_memory,
-        cli_no_memory: flags.no_memory,
+        memory_enabled_override: flags.memory_enabled_override,
         disable_web_search: flags.disable_web_search,
         todo_gate: flags.todo_gate,
         laziness_debug_log: flags.laziness_debug_log.as_deref(),
@@ -300,6 +304,7 @@ pub async fn connect_via_leader(
         terminal: flags.terminal,
         fs_read: flags.fs_read,
         fs_write: flags.fs_write,
+        status_line: flags.status_line,
     };
 
     startup::enter(StartupPhase::LeaderConnect);
@@ -406,11 +411,8 @@ fn warn_unsupported_leader_flags(flags: &ConnectFlags) {
 
 fn unsupported_leader_flags(flags: &ConnectFlags) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if flags.experimental_memory {
-        out.push("--experimental-memory");
-    }
-    if flags.no_memory {
-        out.push("--no-memory");
+    if let Some(flag) = flags.memory_override_flag {
+        out.push(flag);
     }
     if flags.disable_web_search {
         out.push("--disable-web-search");
@@ -482,12 +484,14 @@ fn build_initialize_meta(flags: &ConnectFlags) -> serde_json::Value {
 fn client_capabilities_meta(flags: &ConnectFlags) -> serde_json::Value {
     let hunk_mode =
         crate::settings::canonical_hunk_tracker_mode(flags.hunk_tracker_mode.as_deref());
-    serde_json::json!({
+    let mut meta = serde_json::json!({
         "x.ai/incrementalBashOutput": true,
         "x.ai/hunkTracker": { "mode": hunk_mode },
         "x.ai/bashOutputNoColor": true,
         "x.ai/gitHeadChanged": true,
-    })
+    });
+    meta[xai_grok_status_line::STATUS_LINE_CAPABILITY] = flags.status_line.into();
+    meta
 }
 
 /// Parse `defaultAuthMethodId` from `InitializeResponse.meta`.
@@ -1060,20 +1064,29 @@ mod tests {
     #[test]
     fn unsupported_leader_flags_detects_all() {
         let flags = ConnectFlags {
-            experimental_memory: true,
-            no_memory: true,
+            memory_enabled_override: Some(true),
+            memory_override_flag: Some("--experimental-memory"),
             disable_web_search: true,
             storage_mode: Some("writeback".into()),
             subagents: true,
             ..Default::default()
         };
         let detected = unsupported_leader_flags(&flags);
-        assert_eq!(detected.len(), 5);
+        assert_eq!(detected.len(), 4);
         assert!(detected.contains(&"--experimental-memory"));
-        assert!(detected.contains(&"--no-memory"));
         assert!(detected.contains(&"--disable-web-search"));
         assert!(detected.contains(&"--storage-mode"));
         assert!(detected.contains(&"--subagents"));
+    }
+
+    #[test]
+    fn unsupported_leader_flags_preserves_no_memory_spelling() {
+        let flags = ConnectFlags {
+            memory_enabled_override: Some(false),
+            memory_override_flag: Some("--no-memory"),
+            ..Default::default()
+        };
+        assert_eq!(unsupported_leader_flags(&flags), vec!["--no-memory"]);
     }
 
     #[test]
@@ -1138,6 +1151,20 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(blank["x.ai/hunkTracker"]["mode"], "agent_only");
+    }
+
+    /// The agent gates the whole payload on this key, so a misspelling on
+    /// either side switches the feature off with nothing to show for it.
+    #[test]
+    fn client_capabilities_meta_advertises_the_status_line_the_config_asked_for() {
+        let key = xai_grok_status_line::STATUS_LINE_CAPABILITY;
+        for wants_a_row in [true, false] {
+            let meta = client_capabilities_meta(&ConnectFlags {
+                status_line: wants_a_row,
+                ..Default::default()
+            });
+            assert_eq!(meta[key], wants_a_row, "status_line={wants_a_row}");
+        }
     }
 
     #[test]
